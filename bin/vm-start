@@ -1,0 +1,58 @@
+#!/bin/sh
+
+set -e
+
+VM_NAME="${1}"
+if [ -z ${VM_NAME} ] ; then
+ echo "FAIL!!!!!!!!!"
+ exit 1
+fi
+VM_DIR="/Users/Shared/qemu/vms/${VM_NAME}"
+
+ENV_FILE="${VM_DIR}/config"
+[ -f "$ENV_FILE" ] || {
+    printf 'ERROR: Missing config file(%s)\n' "$ENV_FILE" >&2
+    exit 1
+}
+
+QGA_SOCKET="$VM_DIR/qemu-ga.sock"
+QMP_SOCKET="$VM_DIR/qmp.sock"
+
+# Remove a stale sockets guest-agent socket left behind by an earlier QEMU process.
+rm -f "$QGA_SOCKET" "$QMP_SOCKET"
+
+set -a
+. "${ENV_FILE}"
+set +a
+
+QEMU="/opt/homebrew/bin/qemu-system-aarch64"
+
+sudo "$QEMU" \
+  -name "${VM_NAME}" \
+  -machine virt,accel=hvf,highmem=on \
+  -cpu host \
+  -smp "${CPUS}" \
+  -m "${MEMORY}" \
+  \
+  -drive if=pflash,format=raw,readonly=on,file="${VM_DIR}/firmware" \
+  -drive if=pflash,format=raw,file="${VM_DIR}/bios" \
+  -drive if=none,id=osdisk,format=qcow2,file="${VM_DIR}/virtual-hard-disk" \
+  -device virtio-blk-pci,drive=osdisk \
+  \
+  -drive if=none,id=seed,format=raw,readonly=on,file="${VM_DIR}/cidata.iso" \
+  -device virtio-blk-pci,drive=seed \
+  \
+  -netdev vmnet-bridged,id=net0,ifname=en1 \
+  -device virtio-net-pci,netdev=net0,mac="${MAC}" \
+  \
+  -chardev socket,id=qga0,path="$QGA_SOCKET",server=on,wait=off \
+  -device virtio-serial-pci \
+  -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
+  \
+  -qmp unix:"$QMP_SOCKET",server=on,wait=off \
+  \
+  -device virtio-rng-pci \
+  \
+  -nographic \
+  -serial mon:stdio
+
