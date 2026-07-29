@@ -1,0 +1,81 @@
+#cloud-config
+
+hostname: ${VM_NAME}${VM_INSTANCE}
+fqdn: ${VM_NAME}${VM_INSTANCE}.${VM_DOMAIN}
+prefer_fqdn_over_hostname: false
+manage_etc_hosts: true
+
+timezone: America/New_York
+
+users:
+  # - default
+  - name: ${VM_NAME}
+    gecos: VM User
+    groups:
+      - adm
+      - sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    # DEBUG: Remove before complete
+    # lock_passwd: true
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${VM_SSH_PUBLIC_KEY}
+
+ssh_pwauth: false
+disable_root: true
+
+# DEBUG: Used for testing -- Remark before complete
+# chpasswd:
+#   expire: false
+#   users:
+#     - name: jupiter
+#       password: jupiter
+#       type: text
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-cloud-init-password.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - qemu-guest-agent
+  - curl
+  - wget
+  - git
+  - vim
+  - tmux
+  - jq
+  - htop
+  - tree
+  - unzip
+  - rsync
+  - dnsutils
+  - iputils-ping
+  - traceroute
+  - net-tools
+  - chrony
+  - ca-certificates
+
+runcmd:
+  - systemctl enable --now chrony
+  - systemctl enable --now qemu-guest-agent
+  - sshd -t
+  - systemctl restart ssh
+  
+growpart:
+  mode: auto
+  devices:
+    - /
+  ignore_growroot_disabled: false
+
+resize_rootfs: true
+
+final_message: |
+  ***** CLOUD-INIT COMPLETED *****

@@ -1,0 +1,21 @@
+version: 2
+renderer: networkd
+
+ethernets:
+  lan:
+  # enp0s3:
+    match:
+      macaddress: "${VM_MAC}"
+    set-name: enp0s3
+    optional: true
+    dhcp4: false
+    dhcp6: false
+    addresses:
+      - ${VM_IP}
+    routes:
+      - to: default
+        via: ${VM_GATEWAY}
+    nameservers:
+      addresses:
+        - ${VM_GATEWAY}
+    dhcp-identifier: mac

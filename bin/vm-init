@@ -1,0 +1,177 @@
+#!/bin/sh
+
+set -eu
+YELLOW='\033[33m'
+RED='\033[31m'
+# GREEN='\033[32m'
+# BLUE='\033[34m'
+# BOLD='\033[1m'
+RESET='\033[0m'
+
+warn() {
+  printf 'WARN: %s\n' "$*" >&2
+}
+
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+load_vm_variable() {
+    _key="${1:-}"
+    [ -n "$_key" ] ||
+        fail "Environment-variable key was not provided"
+    # Fail when the variable is unset or empty.
+    [ -n "${!_key:-}" ] ||
+        fail "Required environment variable is unset or empty: $_key"
+    _target="VM_${_key}"
+    export "${_target}=${!_key}"
+    printf ' - - Variable: %s=%s\n' "${_target}" "${!_key}"
+    unset ${_key}
+}
+
+# Verify exactly one argument was provided.
+[ "$#" -eq 1 ] ||
+    fail "Usage: ${0} <vm config file>"
+
+# Verify the config file
+CONFIG_FILE="${1}"
+# Verify it exists.
+[ -e "${CONFIG_FILE}" ] ||
+    fail "File does not exist: ${CONFIG_FILE}"
+# Verify it is a regular file.
+[ -f "${CONFIG_FILE}" ] ||
+    fail "Not a regular file: ${CONFIG_FILE}"
+# Verify it is readable.
+[ -r "${CONFIG_FILE}" ] ||
+    fail "File is not readable: ${CONFIG_FILE}"
+printf ' - Using config file: %s\n' "${CONFIG_FILE}"
+
+set -a
+# shellcheck disable=SC1090
+. "${CONFIG_FILE}"
+set +a
+load_vm_variable "NAME"
+load_vm_variable "INSTANCE"
+load_vm_variable "DOMAIN"
+load_vm_variable "CPUS"
+load_vm_variable "MEMORY"
+load_vm_variable "DISK"
+load_vm_variable "IP"
+load_vm_variable "MAC"
+load_vm_variable "GATEWAY"
+load_vm_variable "OS"
+
+
+# Make sure the qemu folder is setup. This is where all VM files and scripts
+# are kept in this location.
+QEMU_DIR="/Users/Shared/qemu"
+sudo mkdir -p "${QEMU_DIR}"
+sudo chown -R "${USER}":staff "${QEMU_DIR}"
+# VM location
+VMS_DIR="${QEMU_DIR}/vms"
+mkdir -p "${VMS_DIR}"
+# OS Image location
+IMAGES_DIR="${QEMU_DIR}/images"
+mkdir -p "${IMAGES_DIR}"
+TEMPLATE_DIR="${QEMU_DIR}/templates"
+mkdir -p "${TEMPLATE_DIR}"
+printf ' - QEMU VM folder(%s)\n' "${QEMU_DIR}"
+printf ' - - VMs folder(%s)\n' "${VMS_DIR}"
+printf ' - - Images folder(%s)\n' "${IMAGES_DIR}"
+printf ' - - Templates folder(%s)\n' "${TEMPLATE_DIR}"
+VM_DIR="${VMS_DIR}/${VM_NAME}"
+if [ -d "${VM_DIR}" ] ; then
+  fail "Existing Virtual Machine(${VM_NAME}) at '${VM_DIR}'"
+else
+  mkdir -p "${VM_DIR}"
+  printf ' - - VM folder(%s)\n' "${VM_DIR}"
+  cp -v "${CONFIG_FILE}" "${VM_DIR}/config"
+fi
+printf '\n\n\n'
+
+# ------------------------------------------------------------------ BASE IMAGE
+IMAGE_DOMAIN="cloud-images.ubuntu.com"
+IMAGE_URL="https://${IMAGE_DOMAIN}/releases/${VM_OS}/release/"
+IMAGE_SOURCE="ubuntu-${VM_OS}-server-cloudimg-arm64.img"
+
+IMAGE_FILE="${IMAGES_DIR}/ubuntu-${VM_OS}.img"
+printf ' - Base Image(%s) Refresh\n' "${IMAGE_FILE}"
+if [ ! -f "${IMAGE_FILE}" ] ; then 
+curl --fail --location --output "${IMAGE_FILE}" --progress-bar \
+  "${IMAGE_URL}/${IMAGE_SOURCE}"
+fi
+IMAGE_CSUM="SHA256SUMS"
+IMAGE_SHA256SUM="${IMAGES_DIR}/${IMAGE_CSUM}"
+curl --fail --location --output "${IMAGE_SHA256SUM}" --progress-bar \
+  "${IMAGE_URL}/${IMAGE_CSUM}" 
+EXPECTED="$(awk '$2 == "*${IMAGE_SOURCE}" || $2 == "${IMAGE_SOURCE}" {print $1}' "${IMAGE_SHA256SUM}")"
+ACTUAL="$(
+  shasum -a 256 ${IMAGE_FILE} |
+  awk '{print $1}'
+)"
+printf ' - - Checksum Actual:   %s\n' "${ACTUAL}"
+printf ' - - Checksum Expected: %s\n' "${EXPECTED}"
+test -n "$EXPECTED" &&
+test "$EXPECTED" = "$ACTUAL" &&
+echo " - - Checksum VERIFIED"
+chmod 0444 "${IMAGE_FILE}"
+printf '\n\n\n'
+
+# --------------------------------------------------------------------- STORAGE
+VHD_FILE="${VM_DIR}/virtual-hard-disk"
+printf ' - Initialize VHD(%s)' "${VHD_FILE}"
+if [ ! -f "${VHD_FILE}" ] ; then 
+  qemu-img create -f qcow2 -F qcow2 -b "${IMAGE_FILE}" "${VHD_FILE}"
+  qemu-img resize "${VHD_FILE}" "${VM_DISK}"
+fi
+printf '\n\n\n'
+
+
+# -------------------------------------------------------------------- FIRMWARE
+FIRMWARE_DIR="$(brew --prefix qemu)/share/qemu"
+printf ' - Firware directory(%s)\n' "${FIRMWARE_DIR}"
+FIRMWARE_SOURCE="edk2-aarch64-code.fd"
+printf ' - Initialize Firmware(%s)' "${FIRMWARE_SOURCE}"
+FIRMWARE_TEMPLATE="${FIRMWARE_DIR}/${FIRMWARE_SOURCE}"
+FIRMWARE_FILE="${VM_DIR}/firmware"
+if [[ ! -f "${FIRMWARE_FILE}" ]] ; then
+  cp -v "${FIRMWARE_TEMPLATE}" "${FIRMWARE_FILE}"
+fi
+printf '\n\n\n'
+
+# ------------------------------------------------------------------------ BIOS
+BIOS_SOURCE="edk2-arm-vars.fd"
+printf ' - Initialize BIOS(%s)' "${BIOS_SOURCE}"
+BIOS_TEMPLATE="${FIRMWARE_DIR}/${BIOS_SOURCE}" 
+BIOS_FILE="${VM_DIR}/bios"
+if [[ ! -f "${BIOS_FILE}" ]] ; then
+  cp -v "${BIOS_TEMPLATE}" "${BIOS_FILE}"
+fi
+printf '\n\n\n'
+
+# --------------------------------------------------------------------- SOCKETS
+printf "Sockets: Should be moved to start\n"
+SERIAL_SOCKET="$VM_DIR/serial.sock"
+QGA_SOCKET="$VM_DIR/qemu-ga.sock"
+QMP_SOCKET="$VM_DIR/qmp.sock"
+# Remove a stale sockets guest-agent socket left behind by an
+# earlier QEMU process.
+rm -vf "${SERIAL_SOCKET}" "${QGA_SOCKET}" "${QMP_SOCKET}"
+printf '\n\n\n'
+
+# ------------------------------------------------------------------- TEMPLATES
+TEMP_DIR="$(mktemp -d)"
+VM_BUILD="$(printf '%x\n' "$(date +%s)")"
+export VM_BUILD
+envsubst < "${TEMPLATE_DIR}/meta-data" > "${TEMP_DIR}/meta-data"
+envsubst < "${TEMPLATE_DIR}/network-config" > "${TEMP_DIR}/network-config"
+VM_SSH="$(cat "$HOME/.config/ssh/id_ed25519.pub")"
+export VM_SSH
+envsubst < "${TEMPLATE_DIR}/user-data" > "${TEMP_DIR}/user-data"
+unset VM_BUILD
+unset VM_SSH
+CIDATA_FILE="${VM_DIR}/cidata"
+hdiutil makehybrid -o "${CIDATA_FILE}" "${TEMP_DIR}" -iso \
+  -joliet -default-volume-name cidata
+rm -rf "${TEMP_DIR}"
