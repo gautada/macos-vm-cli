@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# vm-halt <vm name> - ask the guest OS to shut down gracefully (QMP
+# "system_powerdown", an ACPI power button event), then wait for qemu to
+# actually exit and detach the bundle. The guest decides how to respond
+# to the request, so this can take a while - override the default 120s
+# budget with VM_HALT_TIMEOUT if needed.
+#
+# bin/vm-start returns as soon as the guest is up rather than staying
+# attached for the VM's whole lifetime, so this script - the one actually
+# ending the VM - is what detaches the bundle once qemu is confirmed gone.
+
+set -eu
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
+
+require_running_vm "${1:-}"
+
+printf ' - Requesting ACPI shutdown for VM "%s" (pid %s)\n' "${VM_NAME}" "${VM_PID}"
+qmp_run '{"execute":"system_powerdown"}' >/dev/null
+
+HALT_TIMEOUT="${VM_HALT_TIMEOUT:-120}"
+printf ' - Waiting up to %ss for the guest to power off...\n' "${HALT_TIMEOUT}"
+wait_for_exit_and_detach "${HALT_TIMEOUT}"
+
+printf 'VM "%s" halted and bundle detached.\n' "${VM_NAME}"

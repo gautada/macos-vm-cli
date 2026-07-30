@@ -1,0 +1,17 @@
+#!/bin/sh
+#
+# vm-restart <vm name> - hard-reset a running VM (like pressing a
+# physical reset button): qemu itself stays up, but the guest reboots
+# immediately with no graceful shutdown (QMP "system_reset"). For a
+# graceful reboot, ask the guest to shut down with bin/vm-halt and start
+# it again with bin/vm-start once it has stopped.
+
+set -eu
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
+
+require_running_vm "${1:-}"
+
+printf ' - Resetting VM "%s" (pid %s)\n' "${VM_NAME}" "${VM_PID}"
+qmp_run '{"execute":"system_reset"}' >/dev/null
+printf 'VM "%s" reset.\n' "${VM_NAME}"

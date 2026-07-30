@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+# vm-pause <vm name> - suspend a running VM's execution in place (QMP
+# "stop"). The guest is frozen exactly where it is - CPUs stop, but
+# nothing is torn down. Resume it with bin/vm-resume.
+
+set -eu
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
+
+require_running_vm "${1:-}"
+
+printf ' - Pausing VM "%s" (pid %s)\n' "${VM_NAME}" "${VM_PID}"
+qmp_run '{"execute":"stop"}' >/dev/null
+printf 'VM "%s" paused.\n' "${VM_NAME}"

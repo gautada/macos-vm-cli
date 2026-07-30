@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# vm-status <vm name> - report whether a VM is running and, if so, its
+# guest execution state (running/paused/...) per QMP. Safe to run at any
+# time - unlike the other vm-<verb> scripts, this never fails just
+# because the VM isn't running.
+
+set -eu
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
+
+resolve_vm "${1:-}"
+
+if ! vm_is_running ; then
+    printf 'VM "%s": not running\n' "${VM_NAME}"
+    exit 0
+fi
+
+printf 'VM "%s": running (pid %s)\n' "${VM_NAME}" "${VM_PID}"
+
+if [ -S "${QMP_SOCKET}" ] ; then
+    REPLY="$(qmp_send '{"execute":"query-status"}' || true)"
+    STATE="$(printf '%s\n' "${REPLY}" | jq -r 'select(.return != null) | .return.status' 2>/dev/null | tail -n1)"
+    if [ -n "${STATE}" ] ; then
+        printf ' - - Guest state: %s\n' "${STATE}"
+    else
+        warn "Could not read guest state over QMP (sudo declined, or qemu didn't reply in time)"
+    fi
+else
+    warn "QMP socket not found(${QMP_SOCKET})"
+fi

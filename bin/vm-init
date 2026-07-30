@@ -1,22 +1,37 @@
 #!/bin/sh
+#
+# vm-init - build a new VM as a self-contained, mountable sparsebundle,
+# and bake a "golden" disk image for it.
+#
+# Everything the VM needs to run (the golden virtual disk, UEFI
+# firmware/vars) is written onto the volume of a sparsebundle disk image
+# at /Users/Shared/qemu/vms/<name>.sparsebundle. The bundle is mounted at
+# /Volumes/<name> only for the duration of this build, then detached.
+# bin/vm-start re-mounts it to actually run the VM.
+#
+# "Baking" means: this script boots the freshly-built disk once, with a
+# cloud-init seed ISO attached, and lets cloud-init do its one-time
+# provisioning (create the user, install packages, configure networking,
+# ...) for real, directly onto the disk. Once the guest agent confirms
+# it's up, this script shuts it down again and flattens the disk with
+# qemu-img so it no longer depends on the base cloud image as a backing
+# file. After that, both the base image copy and the cloud-init seed are
+# deleted from the bundle - neither is needed again, since every future
+# boot (via bin/vm-start) just boots the already-provisioned golden disk
+# directly, with no cloud-init involved at all.
+#
+# See README.md for the full step-by-step description of what this does.
 
 set -eu
-YELLOW='\033[33m'
-RED='\033[31m'
-# GREEN='\033[32m'
-# BLUE='\033[34m'
-# BOLD='\033[1m'
-RESET='\033[0m'
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
 
-warn() {
-  printf 'WARN: %s\n' "$*" >&2
-}
-
-fail() {
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
-}
-
+# Reads a plain variable (e.g. "NAME") that was sourced from the config
+# file, and re-exports it namespaced as "VM_NAME". Namespacing avoids
+# collisions between short config-file names (NAME, DISK, ...) and the
+# rest of this script's own variables, and signals downstream (templates,
+# vm-start) that these came from the VM's config. The original short name
+# is unset immediately after so it can't be accidentally reused below.
 load_vm_variable() {
     _key="${1:-}"
     [ -n "$_key" ] ||
@@ -28,6 +43,23 @@ load_vm_variable() {
     export "${_target}=${!_key}"
     printf ' - - Variable: %s=%s\n' "${_target}" "${!_key}"
     unset ${_key}
+}
+
+# Given a size like "80G" or "512M", print the size in whole gigabytes,
+# rounding up. Used to size the sparsebundle relative to the configured
+# guest disk size.
+size_to_gb() {
+    _val="$1"
+    _unit="${_val##*[0-9]}"
+    _num="${_val%%[!0-9]*}"
+    [ -n "$_num" ] ||
+        fail "Could not parse a numeric size from: $_val"
+    case "$_unit" in
+        G|g|'') printf '%d\n' "$_num" ;;
+        T|t) printf '%d\n' "$((_num * 1024))" ;;
+        M|m) printf '%d\n' "$(((_num + 1023) / 1024))" ;;
+        *) fail "Unsupported size unit '${_unit}' in: $_val" ;;
+    esac
 }
 
 # Verify exactly one argument was provided.
@@ -47,10 +79,14 @@ CONFIG_FILE="${1}"
     fail "File is not readable: ${CONFIG_FILE}"
 printf ' - Using config file: %s\n' "${CONFIG_FILE}"
 
+# `set -a` exports every variable the config file sets (NAME=, DISK=, ...)
+# so they exist in the environment for load_vm_variable to pick up below.
 set -a
 # shellcheck disable=SC1090
 . "${CONFIG_FILE}"
 set +a
+# Every field in the config file is required; load_vm_variable fails fast
+# if any is missing, rather than building a half-configured VM.
 load_vm_variable "NAME"
 load_vm_variable "INSTANCE"
 load_vm_variable "DOMAIN"
@@ -62,32 +98,103 @@ load_vm_variable "MAC"
 load_vm_variable "GATEWAY"
 load_vm_variable "OS"
 
+# Resolve the cloud-init templates relative to this script's own location
+# (not the caller's cwd, and not a copy under /Users/Shared/qemu). The
+# templates are part of this repo, not part of any individual VM, so they
+# should always come from wherever this script itself lives.
+SCRIPT_DIR="$(cd "$(dirname "${0}")/.." && pwd)"
+REPO_TEMPLATES_DIR="${SCRIPT_DIR}/templates"
+[ -d "${REPO_TEMPLATES_DIR}" ] ||
+    fail "Templates directory not found: ${REPO_TEMPLATES_DIR}"
 
-# Make sure the qemu folder is setup. This is where all VM files and scripts
-# are kept in this location.
-QEMU_DIR="/Users/Shared/qemu"
+# /Users/Shared/qemu is shared, host-wide state (not owned by this repo
+# checkout), so it's created/chowned with sudo the first time and reused
+# by every VM. It holds two things:
+#   vms/    - one <name>.sparsebundle package per VM (the actual VMs)
+#   cache/  - downloaded base OS images, shared across VMs of the same OS
+#             release so re-running vm-init doesn't re-download each time
 sudo mkdir -p "${QEMU_DIR}"
 sudo chown -R "${USER}":staff "${QEMU_DIR}"
-# VM location
-VMS_DIR="${QEMU_DIR}/vms"
+# VM bundle location
 mkdir -p "${VMS_DIR}"
-# OS Image location
-IMAGES_DIR="${QEMU_DIR}/images"
-mkdir -p "${IMAGES_DIR}"
-TEMPLATE_DIR="${QEMU_DIR}/templates"
-mkdir -p "${TEMPLATE_DIR}"
-printf ' - QEMU VM folder(%s)\n' "${QEMU_DIR}"
-printf ' - - VMs folder(%s)\n' "${VMS_DIR}"
-printf ' - - Images folder(%s)\n' "${IMAGES_DIR}"
-printf ' - - Templates folder(%s)\n' "${TEMPLATE_DIR}"
-VM_DIR="${VMS_DIR}/${VM_NAME}"
-if [ -d "${VM_DIR}" ] ; then
-  fail "Existing Virtual Machine(${VM_NAME}) at '${VM_DIR}'"
-else
-  mkdir -p "${VM_DIR}"
-  printf ' - - VM folder(%s)\n' "${VM_DIR}"
-  cp -v "${CONFIG_FILE}" "${VM_DIR}/config"
-fi
+# Shared download cache for base OS images, so re-running vm-init for
+# multiple VMs of the same OS release doesn't re-download it each time.
+# Each VM bundle still gets its own copy (below), so the bundle itself
+# stays fully self-contained and portable.
+CACHE_DIR="${QEMU_DIR}/cache/images"
+mkdir -p "${CACHE_DIR}"
+printf ' - QEMU folder(%s)\n' "${QEMU_DIR}"
+printf ' - - VM bundles folder(%s)\n' "${VMS_DIR}"
+printf ' - - Image cache folder(%s)\n' "${CACHE_DIR}"
+
+# Fail rather than silently reuse or overwrite an existing VM of the same
+# name - both the packaged bundle and the mount point are checked, since
+# either one existing means a naming collision that needs the operator's
+# attention (e.g. a leftover mount from a crashed run).
+BUNDLE_PATH="${VMS_DIR}/${VM_NAME}.sparsebundle"
+[ -e "${BUNDLE_PATH}" ] &&
+    fail "Existing Virtual Machine bundle(${VM_NAME}) at '${BUNDLE_PATH}'"
+VM_DIR="/Volumes/${VM_NAME}"
+[ -e "${VM_DIR}" ] &&
+    fail "Mount point already in use: '${VM_DIR}'"
+# Host-side runtime state used during the bake boot below (sockets,
+# pidfile, log) - same paths bin/vm-start uses, so its own stale-state
+# cleanup naturally takes care of anything left behind here.
+RUN_DIR="${QEMU_DIR}/run/${VM_NAME}"
+PID_FILE="${RUN_DIR}/pid"
+QMP_SOCKET="${RUN_DIR}/qmp.sock"
+QGA_SOCKET="${RUN_DIR}/qemu-ga.sock"
+SERIAL_SOCKET="${RUN_DIR}/serial.sock"
+SERIAL_LOG="${RUN_DIR}/serial.log"
+printf '\n\n\n'
+
+# ------------------------------------------------------------------ BUNDLE
+# Size the bundle to the guest disk size plus a fixed overhead for
+# everything else that lives alongside it on the volume (base image,
+# firmware, bios, cidata.iso) - plus enough headroom that the flatten
+# step below can briefly hold the pre-flatten overlay, the base image,
+# and the new flattened copy all at once. Sparsebundles are sparse on
+# disk, so this is only a nominal ceiling, not space actually consumed up
+# front.
+BUNDLE_GB="$(size_to_gb "${VM_DISK}")"
+BUNDLE_OVERHEAD_GB=15
+BUNDLE_SIZE="$((BUNDLE_GB + BUNDLE_OVERHEAD_GB))g"
+printf ' - Creating sparsebundle(%s) size(%s)\n' "${BUNDLE_PATH}" "${BUNDLE_SIZE}"
+# APFS: modern, sparse-file-friendly, handles the large qcow2/base-image
+# files well. -volname controls the label shown when mounted, which is
+# also what determines the /Volumes/<name> mount point below.
+hdiutil create -type SPARSEBUNDLE -fs APFS -volname "${VM_NAME}" \
+  -size "${BUNDLE_SIZE}" "${BUNDLE_PATH}"
+
+printf ' - Attaching bundle at(%s)\n' "${VM_DIR}"
+hdiutil attach "${BUNDLE_PATH}" -mountpoint "${VM_DIR}"
+
+# From here on, a failure or interruption needs to clean up more than
+# just the mount: if the bake boot below is running, its qemu process
+# needs to be stopped first (killing it via sudo, since it runs as root)
+# so the volume isn't detached out from under a still-running qemu. On
+# success, the script reaches its natural end without detaching manually
+# - this trap handles that too, uniformly.
+BAKE_PID=""
+KEEPALIVE_PID=""
+cleanup() {
+    _rc=$?
+    trap - EXIT INT TERM
+    [ -z "${KEEPALIVE_PID}" ] || kill "${KEEPALIVE_PID}" 2>/dev/null || true
+    if [ -n "${BAKE_PID}" ] && ps -p "${BAKE_PID}" >/dev/null 2>&1 ; then
+        warn "Stopping bake-boot qemu process(pid ${BAKE_PID})"
+        sudo kill "${BAKE_PID}" 2>/dev/null || true
+        wait_for_pid_exit "${BAKE_PID}" 30 || true
+    fi
+    hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
+    exit "${_rc}"
+}
+trap cleanup EXIT INT TERM
+
+# Keep a copy of the config inside the bundle - vm-start reads this
+# (as "config") to know how to launch the VM, so the bundle stays
+# self-describing without needing the original .vmc file around.
+cp -v "${CONFIG_FILE}" "${VM_DIR}/config"
 printf '\n\n\n'
 
 # ------------------------------------------------------------------ BASE IMAGE
@@ -95,33 +202,59 @@ IMAGE_DOMAIN="cloud-images.ubuntu.com"
 IMAGE_URL="https://${IMAGE_DOMAIN}/releases/${VM_OS}/release/"
 IMAGE_SOURCE="ubuntu-${VM_OS}-server-cloudimg-arm64.img"
 
-IMAGE_FILE="${IMAGES_DIR}/ubuntu-${VM_OS}.img"
-printf ' - Base Image(%s) Refresh\n' "${IMAGE_FILE}"
-if [ ! -f "${IMAGE_FILE}" ] ; then 
-curl --fail --location --output "${IMAGE_FILE}" --progress-bar \
+# Download into the shared cache (not the bundle) first, so building
+# several VMs on the same OS release only pays the download cost once.
+CACHED_IMAGE_FILE="${CACHE_DIR}/ubuntu-${VM_OS}.img"
+printf ' - Base Image(%s) Refresh\n' "${CACHED_IMAGE_FILE}"
+if [ ! -f "${CACHED_IMAGE_FILE}" ] ; then
+curl --fail --location --output "${CACHED_IMAGE_FILE}" --progress-bar \
   "${IMAGE_URL}/${IMAGE_SOURCE}"
 fi
+# Verify the download against Ubuntu's published checksums before trusting
+# it as a VM's disk backing file - a corrupted or tampered image would
+# otherwise fail silently or much later, deep inside the guest.
 IMAGE_CSUM="SHA256SUMS"
-IMAGE_SHA256SUM="${IMAGES_DIR}/${IMAGE_CSUM}"
+IMAGE_SHA256SUM="${CACHE_DIR}/${IMAGE_CSUM}"
 curl --fail --location --output "${IMAGE_SHA256SUM}" --progress-bar \
-  "${IMAGE_URL}/${IMAGE_CSUM}" 
-EXPECTED="$(awk '$2 == "*${IMAGE_SOURCE}" || $2 == "${IMAGE_SOURCE}" {print $1}' "${IMAGE_SHA256SUM}")"
+  "${IMAGE_URL}/${IMAGE_CSUM}"
+EXPECTED="$(awk -v src="${IMAGE_SOURCE}" '$2 == "*" src || $2 == src {print $1}' "${IMAGE_SHA256SUM}")"
 ACTUAL="$(
-  shasum -a 256 ${IMAGE_FILE} |
+  shasum -a 256 ${CACHED_IMAGE_FILE} |
   awk '{print $1}'
 )"
 printf ' - - Checksum Actual:   %s\n' "${ACTUAL}"
 printf ' - - Checksum Expected: %s\n' "${EXPECTED}"
-test -n "$EXPECTED" &&
-test "$EXPECTED" = "$ACTUAL" &&
-echo " - - Checksum VERIFIED"
+[ -n "${EXPECTED}" ] ||
+    fail "Could not find an expected checksum for ${IMAGE_SOURCE} in ${IMAGE_SHA256SUM}"
+[ "${EXPECTED}" = "${ACTUAL}" ] ||
+    fail "Checksum mismatch for ${CACHED_IMAGE_FILE}: expected ${EXPECTED}, got ${ACTUAL}"
+printf ' - - Checksum VERIFIED\n'
+# Read-only: this cached copy is shared across VMs, so nothing should be
+# able to mutate it out from under another VM's build.
+chmod 0444 "${CACHED_IMAGE_FILE}"
+
+# Copy the verified image into the bundle itself. This is what makes the
+# bundle fully self-contained: the qcow2 disk created below is backed by
+# this in-bundle copy (not the shared cache), so the whole VM - including
+# its backing image - travels together if the bundle is moved elsewhere.
+IMAGES_DIR="${VM_DIR}/images"
+mkdir -p "${IMAGES_DIR}"
+IMAGE_FILE="${IMAGES_DIR}/ubuntu-${VM_OS}.img"
+printf ' - Copying base image into bundle(%s)\n' "${IMAGE_FILE}"
+cp -v "${CACHED_IMAGE_FILE}" "${IMAGE_FILE}"
 chmod 0444 "${IMAGE_FILE}"
 printf '\n\n\n'
 
 # --------------------------------------------------------------------- STORAGE
+# The guest's actual disk is a qcow2 copy-on-write overlay on top of the
+# base image copy above, not a full copy of it - this keeps the VM's own
+# writes small and fast to create. -b/-F point qemu-img at the backing
+# file and its format; resize then grows the overlay to the configured
+# DISK size (the guest filesystem itself grows into this via cloud-init's
+# growpart/resize_rootfs on first boot - see templates/user-data).
 VHD_FILE="${VM_DIR}/virtual-hard-disk"
 printf ' - Initialize VHD(%s)' "${VHD_FILE}"
-if [ ! -f "${VHD_FILE}" ] ; then 
+if [ ! -f "${VHD_FILE}" ] ; then
   qemu-img create -f qcow2 -F qcow2 -b "${IMAGE_FILE}" "${VHD_FILE}"
   qemu-img resize "${VHD_FILE}" "${VM_DISK}"
 fi
@@ -129,11 +262,15 @@ printf '\n\n\n'
 
 
 # -------------------------------------------------------------------- FIRMWARE
+# UEFI firmware/vars shipped by Homebrew's qemu package, needed to boot an
+# aarch64 guest (there's no legacy BIOS boot path on arm64).
 FIRMWARE_DIR="$(brew --prefix qemu)/share/qemu"
 printf ' - Firware directory(%s)\n' "${FIRMWARE_DIR}"
 FIRMWARE_SOURCE="edk2-aarch64-code.fd"
 printf ' - Initialize Firmware(%s)' "${FIRMWARE_SOURCE}"
 FIRMWARE_TEMPLATE="${FIRMWARE_DIR}/${FIRMWARE_SOURCE}"
+# Firmware code itself is identical for every VM and never written to at
+# runtime (see vm-start's -drive ...,readonly=on), so it's just copied in.
 FIRMWARE_FILE="${VM_DIR}/firmware"
 if [[ ! -f "${FIRMWARE_FILE}" ]] ; then
   cp -v "${FIRMWARE_TEMPLATE}" "${FIRMWARE_FILE}"
@@ -143,35 +280,158 @@ printf '\n\n\n'
 # ------------------------------------------------------------------------ BIOS
 BIOS_SOURCE="edk2-arm-vars.fd"
 printf ' - Initialize BIOS(%s)' "${BIOS_SOURCE}"
-BIOS_TEMPLATE="${FIRMWARE_DIR}/${BIOS_SOURCE}" 
+BIOS_TEMPLATE="${FIRMWARE_DIR}/${BIOS_SOURCE}"
+# Unlike firmware, the vars file must be a per-VM writable copy: UEFI
+# stores boot-variable state (boot order, etc.) into it at runtime, so
+# sharing one file across VMs would let them clobber each other's state.
 BIOS_FILE="${VM_DIR}/bios"
 if [[ ! -f "${BIOS_FILE}" ]] ; then
   cp -v "${BIOS_TEMPLATE}" "${BIOS_FILE}"
 fi
 printf '\n\n\n'
 
-# --------------------------------------------------------------------- SOCKETS
-printf "Sockets: Should be moved to start\n"
-SERIAL_SOCKET="$VM_DIR/serial.sock"
-QGA_SOCKET="$VM_DIR/qemu-ga.sock"
-QMP_SOCKET="$VM_DIR/qmp.sock"
-# Remove a stale sockets guest-agent socket left behind by an
-# earlier QEMU process.
-rm -vf "${SERIAL_SOCKET}" "${QGA_SOCKET}" "${QMP_SOCKET}"
-printf '\n\n\n'
-
 # ------------------------------------------------------------------- TEMPLATES
+# Build the cloud-init "NoCloud" seed: meta-data, network-config, and
+# user-data, rendered from templates/ with this VM's settings, then
+# packaged into an ISO the guest reads on first (and every) boot.
 TEMP_DIR="$(mktemp -d)"
+# VM_BUILD is a unique-per-build instance id. cloud-init only re-runs its
+# setup for an instance-id it hasn't seen before, so this forces a fresh
+# cloud-init run if a VM with this name is ever rebuilt, instead of the
+# guest thinking it's booting the same instance again.
 VM_BUILD="$(printf '%x\n' "$(date +%s)")"
 export VM_BUILD
-envsubst < "${TEMPLATE_DIR}/meta-data" > "${TEMP_DIR}/meta-data"
-envsubst < "${TEMPLATE_DIR}/network-config" > "${TEMP_DIR}/network-config"
+envsubst < "${REPO_TEMPLATES_DIR}/meta-data" > "${TEMP_DIR}/meta-data"
+envsubst < "${REPO_TEMPLATES_DIR}/network-config" > "${TEMP_DIR}/network-config"
+# Bake in the operator's own SSH public key so the guest is reachable
+# immediately after boot without any manual console access.
 VM_SSH="$(cat "$HOME/.config/ssh/id_ed25519.pub")"
 export VM_SSH
-envsubst < "${TEMPLATE_DIR}/user-data" > "${TEMP_DIR}/user-data"
+envsubst < "${REPO_TEMPLATES_DIR}/user-data" > "${TEMP_DIR}/user-data"
 unset VM_BUILD
 unset VM_SSH
 CIDATA_FILE="${VM_DIR}/cidata"
+# hdiutil makehybrid -iso appends .iso automatically, producing
+# cidata.iso - only needed for the bake boot below, not by bin/vm-start.
 hdiutil makehybrid -o "${CIDATA_FILE}" "${TEMP_DIR}" -iso \
   -joliet -default-volume-name cidata
 rm -rf "${TEMP_DIR}"
+printf '\n\n\n'
+
+# --------------------------------------------------------------- BAKE BOOT
+# Boot the disk once with the cloud-init seed attached, so cloud-init's
+# one-time provisioning actually runs and writes its results (user
+# account, SSH key, packages, network config) directly onto
+# virtual-hard-disk. Every future boot (bin/vm-start) skips all of this -
+# it just boots the already-provisioned disk with no seed attached.
+mkdir -p "${RUN_DIR}"
+rm -f "${SERIAL_SOCKET}" "${QGA_SOCKET}" "${QMP_SOCKET}" "${PID_FILE}" "${RUN_DIR}/qemu.log" "${SERIAL_LOG}"
+# Pre-create the serial log as the plain user, and before qemu (running
+# as root via sudo) ever opens it - writing to an already-existing file
+# doesn't change its permissions, so this keeps it readable without sudo
+# for debugging, unlike files qemu creates itself from scratch.
+: > "${SERIAL_LOG}"
+chmod 644 "${SERIAL_LOG}"
+
+QEMU="/opt/homebrew/bin/qemu-system-aarch64"
+
+# Needed for both the qemu launch and the guest-agent polling below; kept
+# refreshed in the background since this boot (cloud-init installing and
+# upgrading packages) can take several minutes.
+sudo -v
+( while true ; do sudo -n -v 2>/dev/null ; sleep 60 ; done ) &
+KEEPALIVE_PID=$!
+
+printf ' - Booting to let cloud-init provision the disk (this can take several minutes)...\n'
+nohup sudo "$QEMU" \
+  -name "${VM_NAME}" \
+  -machine virt,accel=hvf,highmem=on \
+  -cpu host \
+  -smp "${VM_CPUS}" \
+  -m "${VM_MEMORY}" \
+  \
+  -drive if=pflash,format=raw,readonly=on,file="${FIRMWARE_FILE}" \
+  -drive if=pflash,format=raw,file="${BIOS_FILE}" \
+  -drive if=none,id=osdisk,format=qcow2,file="${VHD_FILE}" \
+  -device virtio-blk-pci,drive=osdisk \
+  \
+  -drive if=none,id=seed,format=raw,readonly=on,file="${CIDATA_FILE}.iso" \
+  -device virtio-blk-pci,drive=seed \
+  \
+  -netdev vmnet-bridged,id=net0,ifname=en1 \
+  -device virtio-net-pci,netdev=net0,mac="${VM_MAC}" \
+  \
+  -chardev socket,id=qga0,path="${QGA_SOCKET}",server=on,wait=off \
+  -device virtio-serial-pci \
+  -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
+  \
+  -qmp unix:"${QMP_SOCKET}",server=on,wait=off \
+  \
+  -chardev socket,id=serial0,path="${SERIAL_SOCKET}",server=on,wait=off,logfile="${SERIAL_LOG}",logappend=on \
+  -serial chardev:serial0 \
+  -monitor none \
+  -display none \
+  \
+  -device virtio-rng-pci \
+  </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+BAKE_PID=$!
+disown 2>/dev/null || true
+printf '%s\n' "${BAKE_PID}" > "${PID_FILE}"
+
+sleep 2
+ps -p "${BAKE_PID}" >/dev/null 2>&1 ||
+    fail "qemu exited immediately during bake boot - see ${RUN_DIR}/qemu.log and ${SERIAL_LOG}"
+
+BAKE_TIMEOUT="${VM_BAKE_TIMEOUT:-900}"
+printf ' - Waiting for guest agent to respond (up to %ss)\n' "${BAKE_TIMEOUT}"
+ELAPSED=0
+READY=0
+while [ "${ELAPSED}" -lt "${BAKE_TIMEOUT}" ] ; do
+    if qga_ping 2 ; then
+        READY=1
+        break
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+    printf '.'
+done
+printf '\n'
+[ "${READY}" -eq 1 ] ||
+    fail "Guest agent didn't respond within ${BAKE_TIMEOUT}s during bake boot - see ${RUN_DIR}/qemu.log and ${SERIAL_LOG}"
+printf ' - Guest is up and cloud-init has provisioned the disk.\n'
+
+printf ' - Requesting shutdown so the disk can be finalized...\n'
+qmp_send '{"execute":"system_powerdown"}' >/dev/null
+BAKE_SHUTDOWN_TIMEOUT="${VM_BAKE_SHUTDOWN_TIMEOUT:-120}"
+wait_for_pid_exit "${BAKE_PID}" "${BAKE_SHUTDOWN_TIMEOUT}" ||
+    fail "Guest didn't power off within ${BAKE_SHUTDOWN_TIMEOUT}s during bake boot"
+BAKE_PID=""
+rm -f "${PID_FILE}"
+
+kill "${KEEPALIVE_PID}" 2>/dev/null || true
+KEEPALIVE_PID=""
+printf '\n\n\n'
+
+# ------------------------------------------------------------------ FLATTEN
+# virtual-hard-disk is still a thin qcow2 overlay backed by the base
+# image copy - it only has the blocks cloud-init's provisioning actually
+# changed. Flatten it into a fully standalone image (no backing file), so
+# the base image and cloud-init seed are no longer needed by anything.
+printf ' - Finalizing golden disk image(%s)\n' "${VHD_FILE}"
+qemu-img convert -p -f qcow2 -O qcow2 "${VHD_FILE}" "${VHD_FILE}.flattened"
+mv "${VHD_FILE}.flattened" "${VHD_FILE}"
+
+printf ' - Removing base image and cloud-init seed (no longer needed after baking)\n'
+rm -rf "${IMAGES_DIR}"
+rm -f "${CIDATA_FILE}.iso"
+printf '\n\n\n'
+
+# --------------------------------------------------------------------- DETACH
+# The build is done - detach so the bundle goes back to being an inert
+# file on disk. It stays that way until vm-start mounts it again to run
+# the VM. Reaching the end of the script normally triggers the cleanup
+# trap above, which detaches it - no separate detach needed here.
+
+printf '\n'
+printf 'VM "%s" built at: %s\n' "${VM_NAME}" "${BUNDLE_PATH}"
+printf 'Run "bin/vm-start %s" to mount and start it.\n' "${VM_NAME}"

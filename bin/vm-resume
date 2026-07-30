@@ -1,0 +1,14 @@
+#!/bin/sh
+#
+# vm-resume <vm name> - resume a VM previously suspended with bin/vm-pause
+# (QMP "cont").
+
+set -eu
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
+
+require_running_vm "${1:-}"
+
+printf ' - Resuming VM "%s" (pid %s)\n' "${VM_NAME}" "${VM_PID}"
+qmp_run '{"execute":"cont"}' >/dev/null
+printf 'VM "%s" resumed.\n' "${VM_NAME}"

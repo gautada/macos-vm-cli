@@ -1,0 +1,24 @@
+#!/bin/sh
+#
+# vm-stop <vm name> - immediately terminate a running VM's qemu process
+# (QMP "quit"), then wait for it to actually exit and detach the bundle.
+# This is a hard stop, equivalent to pulling the power - the guest gets
+# no chance to shut down cleanly and unsaved state is lost. Use
+# bin/vm-halt for a graceful ACPI shutdown instead.
+#
+# bin/vm-start returns as soon as the guest is up rather than staying
+# attached for the VM's whole lifetime, so this script - the one actually
+# ending the VM - is what detaches the bundle once qemu is confirmed gone.
+
+set -eu
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
+
+require_running_vm "${1:-}"
+
+printf ' - Force-stopping VM "%s" (pid %s)\n' "${VM_NAME}" "${VM_PID}"
+qmp_run '{"execute":"quit"}' >/dev/null
+
+wait_for_exit_and_detach "${VM_STOP_TIMEOUT:-30}"
+
+printf 'VM "%s" stopped and bundle detached.\n' "${VM_NAME}"

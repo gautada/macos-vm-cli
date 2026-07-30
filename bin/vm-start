@@ -1,25 +1,65 @@
 #!/bin/sh
+#
+# vm-start - mount a VM's sparsebundle and start it headlessly under
+# qemu, waiting until the guest agent responds before returning control
+# to the shell prompt.
+#
+# This boots the "golden" virtual-hard-disk that bin/vm-init already
+# baked cloud-init's provisioning into - there's no cloud-init seed drive
+# here, so boot should be fast; it's just an already-configured OS
+# starting up, not being provisioned from scratch.
+#
+# qemu is backgrounded (not run with -daemonize: on macOS, qemu's HVF and
+# vmnet backends spin up threads during init, and forking afterwards -
+# exactly what -daemonize does - reliably crashes with an Objective-C
+# runtime fork-safety abort. Backgrounding at the shell level instead
+# forks before qemu's own image is even loaded, which is safe) and
+# detached from this terminal with nohup/disown, so it survives both this
+# script exiting and the terminal itself closing later.
+#
+# This script exits while the VM keeps running in the background. That
+# means, unlike a build step, /Volumes/<name> is deliberately left
+# mounted when this script returns - qemu is still using files there.
+# Whichever script actually stops the VM (bin/vm-halt or bin/vm-stop)
+# waits for qemu to actually exit and detaches the bundle at that point.
 
-set -e
+set -eu
+LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
+. "${LIB_DIR}/vm-lib"
 
-VM_NAME="${1}"
-if [ -z ${VM_NAME} ] ; then
- echo "FAIL!!!!!!!!!"
- exit 1
+resolve_vm "${1:-}"
+
+# A stale pidfile from a crashed run is fine to clean up, but refuse to
+# start a second copy of the same VM if that pid is still alive.
+if vm_is_running ; then
+    fail "VM \"${VM_NAME}\" already running (pid ${VM_PID})"
 fi
-VM_DIR="/Users/Shared/qemu/vms/${VM_NAME}"
+
+# A mount point left behind by an unclean previous exit (e.g. the guest
+# was powered off directly instead of via bin/vm-halt/vm-stop) is safe to
+# reclaim, since we've just confirmed nothing is actually running.
+if [ -e "${VM_DIR}" ] ; then
+    warn "Mount point(${VM_DIR}) exists but VM isn't running - detaching stale mount."
+    hdiutil detach "${VM_DIR}" ||
+        fail "Could not detach stale mount at ${VM_DIR} - resolve this manually before starting."
+fi
+
+mkdir -p "${RUN_DIR}"
+# Remove stale sockets/pidfile/log left behind by an earlier QEMU process.
+rm -f "${SERIAL_SOCKET}" "${QGA_SOCKET}" "${QMP_SOCKET}" "${PID_FILE}" "${RUN_DIR}/qemu.log" "${SERIAL_LOG}"
+# Pre-create the serial log as the plain user, and before qemu (running
+# as root via sudo) ever opens it - writing to an already-existing file
+# doesn't change its permissions, so this keeps it readable without sudo
+# for debugging.
+: > "${SERIAL_LOG}"
+chmod 644 "${SERIAL_LOG}"
+
+printf ' - Attaching bundle(%s) at(%s)\n' "${BUNDLE_PATH}" "${VM_DIR}"
+hdiutil attach "${BUNDLE_PATH}" -mountpoint "${VM_DIR}"
 
 ENV_FILE="${VM_DIR}/config"
-[ -f "$ENV_FILE" ] || {
-    printf 'ERROR: Missing config file(%s)\n' "$ENV_FILE" >&2
-    exit 1
-}
-
-QGA_SOCKET="$VM_DIR/qemu-ga.sock"
-QMP_SOCKET="$VM_DIR/qmp.sock"
-
-# Remove a stale sockets guest-agent socket left behind by an earlier QEMU process.
-rm -f "$QGA_SOCKET" "$QMP_SOCKET"
+[ -f "$ENV_FILE" ] ||
+    fail "Missing config file(${ENV_FILE})"
 
 set -a
 . "${ENV_FILE}"
@@ -27,7 +67,41 @@ set +a
 
 QEMU="/opt/homebrew/bin/qemu-system-aarch64"
 
-sudo "$QEMU" \
+# Tracks whether qemu has successfully launched and stayed up: while
+# that's false, a failure or interruption here means nothing is using the
+# volume yet, so it's safe (and correct) to detach it. Once true, the
+# volume must stay mounted for as long as the background qemu process is
+# running.
+DAEMON_STARTED=0
+KEEPALIVE_PID=""
+
+cleanup() {
+    _rc=$?
+    trap - EXIT INT TERM
+    [ -z "${KEEPALIVE_PID}" ] || kill "${KEEPALIVE_PID}" 2>/dev/null || true
+    if [ "${DAEMON_STARTED}" -eq 0 ] ; then
+        hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
+    fi
+    exit "${_rc}"
+}
+trap cleanup EXIT INT TERM
+
+# Both the qemu launch and the guest-agent polling below need sudo.
+# Authenticate once up front, then keep the ticket refreshed in the
+# background for the rest of this script - otherwise a slow first boot
+# (cloud-init installing packages) could hit repeated password prompts as
+# the cached ticket expires mid-poll.
+sudo -v
+( while true ; do sudo -n -v 2>/dev/null ; sleep 60 ; done ) &
+KEEPALIVE_PID=$!
+
+# -display none / -monitor none / dropping the old mon:stdio serial keep
+# it fully headless; the serial console is still reachable, just over a
+# socket instead of this terminal (see SERIAL_SOCKET in README.md), for
+# debugging. nohup + redirected stdio detach it from this terminal at the
+# OS level; disown drops it from this shell's job table so a later `wait`
+# or job-control action here can't affect it.
+nohup sudo "$QEMU" \
   -name "${VM_NAME}" \
   -machine virt,accel=hvf,highmem=on \
   -cpu host \
@@ -39,20 +113,67 @@ sudo "$QEMU" \
   -drive if=none,id=osdisk,format=qcow2,file="${VM_DIR}/virtual-hard-disk" \
   -device virtio-blk-pci,drive=osdisk \
   \
-  -drive if=none,id=seed,format=raw,readonly=on,file="${VM_DIR}/cidata.iso" \
-  -device virtio-blk-pci,drive=seed \
-  \
   -netdev vmnet-bridged,id=net0,ifname=en1 \
   -device virtio-net-pci,netdev=net0,mac="${MAC}" \
   \
-  -chardev socket,id=qga0,path="$QGA_SOCKET",server=on,wait=off \
+  -chardev socket,id=qga0,path="${QGA_SOCKET}",server=on,wait=off \
   -device virtio-serial-pci \
   -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
   \
-  -qmp unix:"$QMP_SOCKET",server=on,wait=off \
+  -qmp unix:"${QMP_SOCKET}",server=on,wait=off \
+  \
+  -chardev socket,id=serial0,path="${SERIAL_SOCKET}",server=on,wait=off,logfile="${SERIAL_LOG}",logappend=on \
+  -serial chardev:serial0 \
+  -monitor none \
+  -display none \
   \
   -device virtio-rng-pci \
-  \
-  -nographic \
-  -serial mon:stdio
+  </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+QEMU_PID=$!
+disown 2>/dev/null || true
 
+# qemu writes nothing readable to its own stdout once backgrounded like
+# this, so the pidfile is ours to write - as the plain user, not root,
+# which also means later reads of it (bin/vm-lib's vm_is_running, etc.)
+# never hit a permission error.
+printf '%s\n' "${QEMU_PID}" > "${PID_FILE}"
+
+# Give it a moment to fail fast (bad config, vmnet permission issues,
+# the fork-safety crash this replaced -daemonize to avoid, etc.) before
+# committing to treating it as successfully started.
+sleep 2
+ps -p "${QEMU_PID}" >/dev/null 2>&1 ||
+    fail "qemu exited immediately after launch - see ${RUN_DIR}/qemu.log"
+
+DAEMON_STARTED=1
+VM_PID="${QEMU_PID}"
+printf ' - qemu started(pid %s)\n' "${VM_PID}"
+
+# --------------------------------------------------------------- WAIT-READY
+WAIT_TIMEOUT="${VM_START_TIMEOUT:-180}"
+WAIT_INTERVAL=3
+printf ' - Waiting for guest agent to respond (up to %ss; Ctrl-C stops waiting, VM keeps running)\n' "${WAIT_TIMEOUT}"
+ELAPSED=0
+READY=0
+while [ "${ELAPSED}" -lt "${WAIT_TIMEOUT}" ] ; do
+    if qga_ping 2 ; then
+        READY=1
+        break
+    fi
+    sleep "${WAIT_INTERVAL}"
+    ELAPSED=$((ELAPSED + WAIT_INTERVAL))
+    printf '.'
+done
+printf '\n'
+
+if [ "${READY}" -eq 1 ] ; then
+    printf 'VM "%s" is up and responding (pid %s).\n' "${VM_NAME}" "${VM_PID}"
+else
+    warn "Guest agent didn't respond within ${WAIT_TIMEOUT}s - it may still be booting."
+    printf 'qemu is running (pid %s). Check again with "bin/vm-status %s".\n' "${VM_PID}" "${VM_NAME}"
+    # qemu is genuinely still running - this isn't a failed launch, just an
+    # unconfirmed one - so exit with a distinct, non-error code rather than
+    # 1, letting callers tell "started, readiness unconfirmed" apart from
+    # both full success and an actual launch failure.
+    exit 2
+fi

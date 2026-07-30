@@ -1,0 +1,146 @@
+#!/bin/sh
+#
+# vm-lib - shared helpers for the vm-<verb> control scripts (vm-status,
+# vm-halt, vm-stop, vm-restart, vm-pause, vm-resume). Meant to be sourced
+# by those scripts, not executed directly.
+#
+# All control happens over the VM's QMP socket at
+# /Users/Shared/qemu/run/<name>/qmp.sock (created by bin/vm-start). That
+# socket is owned by root because qemu itself runs under sudo (needed for
+# vmnet-bridged networking), so every command here - even a read-only
+# status query - talks to it via `sudo nc -U`.
+
+QEMU_DIR="/Users/Shared/qemu"
+VMS_DIR="${QEMU_DIR}/vms"
+
+warn() {
+    printf 'WARN: %s\n' "$*" >&2
+}
+
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+command -v jq >/dev/null 2>&1 ||
+    fail "This script requires 'jq' (brew install jq)"
+command -v nc >/dev/null 2>&1 ||
+    fail "This script requires 'nc'"
+
+# Resolves a VM name into its paths, without requiring it to be running.
+# Sets: VM_NAME, BUNDLE_PATH, VM_DIR, RUN_DIR, PID_FILE, QMP_SOCKET,
+# QGA_SOCKET, SERIAL_SOCKET, SERIAL_LOG.
+resolve_vm() {
+    VM_NAME="${1:-}"
+    [ -n "${VM_NAME}" ] ||
+        fail "Usage: ${0} <vm name>"
+    BUNDLE_PATH="${VMS_DIR}/${VM_NAME}.sparsebundle"
+    [ -e "${BUNDLE_PATH}" ] ||
+        fail "No VM bundle found(${BUNDLE_PATH}). Run bin/vm-init first."
+
+    VM_DIR="/Volumes/${VM_NAME}"
+    RUN_DIR="${QEMU_DIR}/run/${VM_NAME}"
+    PID_FILE="${RUN_DIR}/pid"
+    QMP_SOCKET="${RUN_DIR}/qmp.sock"
+    QGA_SOCKET="${RUN_DIR}/qemu-ga.sock"
+    SERIAL_SOCKET="${RUN_DIR}/serial.sock"
+    SERIAL_LOG="${RUN_DIR}/serial.log"
+}
+
+# Sets VM_PID and returns success if the VM's pidfile names a live
+# process, failure otherwise. Does not fail the script - callers decide
+# whether "not running" is an error.
+vm_is_running() {
+    [ -f "${PID_FILE}" ] || return 1
+    VM_PID="$(command cat "${PID_FILE}")"
+    [ -n "${VM_PID}" ] || return 1
+    ps -p "${VM_PID}" >/dev/null 2>&1
+}
+
+# Like resolve_vm, but fails with a clear message unless the VM is
+# actually running with a live QMP socket. Use this in every control
+# script that needs to actually talk to a running VM.
+require_running_vm() {
+    resolve_vm "${1:-}"
+    vm_is_running ||
+        fail "VM \"${VM_NAME}\" is not running"
+    [ -S "${QMP_SOCKET}" ] ||
+        fail "QMP socket not found(${QMP_SOCKET}); can't control this VM"
+}
+
+# Sends the QMP capabilities handshake followed by each given single-line
+# JSON command over the VM's QMP socket (QMP_SOCKET must already be set,
+# e.g. by require_running_vm), and prints the raw newline-delimited JSON
+# responses. The trailing sleep gives qemu a moment to reply before nc's
+# own idle timeout closes the connection.
+qmp_send() {
+    {
+        printf '%s\n' '{"execute":"qmp_capabilities"}'
+        for _cmd in "$@" ; do
+            printf '%s\n' "${_cmd}"
+        done
+        sleep 1
+    } | sudo nc -U -w 3 "${QMP_SOCKET}"
+}
+
+# Sends a single QMP command and fails with qemu's own error message if
+# it returns one.
+qmp_run() {
+    _reply="$(qmp_send "$1")"
+    _error="$(printf '%s\n' "${_reply}" | jq -r 'select(.error != null) | .error.desc' 2>/dev/null | tail -n1)"
+    [ -z "${_error}" ] ||
+        fail "qemu: ${_error}"
+    printf '%s\n' "${_reply}"
+}
+
+# Sends a single command to the guest agent (QGA_SOCKET must already be
+# set) and prints its raw reply. Unlike QMP, the guest agent protocol
+# needs no capabilities handshake - commands can be sent as soon as it's
+# connected to.
+qga_send() {
+    printf '%s\n' "$1" | sudo nc -U -w "${2:-3}" "${QGA_SOCKET}"
+}
+
+# Returns success if the guest agent answers a ping within the given
+# per-attempt timeout in seconds (default 3). Used to poll for the guest
+# actually being up, not just qemu itself running.
+qga_ping() {
+    _reply="$(qga_send '{"execute":"guest-ping"}' "${1:-3}" 2>/dev/null)"
+    printf '%s\n' "${_reply}" | jq -e 'select(.return != null)' >/dev/null 2>&1
+}
+
+# Waits (up to $2 seconds) for pid $1 to actually disappear. Returns
+# success if it exited in time; returns failure (without erroring the
+# script) if the timeout was reached, leaving it to the caller to decide
+# what that means.
+wait_for_pid_exit() {
+    _pid="$1"
+    _timeout="$2"
+    _elapsed=0
+    while ps -p "${_pid}" >/dev/null 2>&1 ; do
+        if [ "${_elapsed}" -ge "${_timeout}" ] ; then
+            [ "${_elapsed}" -eq 0 ] || printf '\n' >&2
+            return 1
+        fi
+        sleep 2
+        _elapsed=$((_elapsed + 2))
+        printf '.' >&2
+    done
+    [ "${_elapsed}" -eq 0 ] || printf '\n' >&2
+    return 0
+}
+
+# Waits (up to $1 seconds) for the VM's pid (VM_PID) to actually
+# disappear, then removes its pidfile and detaches the bundle. bin/vm-
+# start no longer blocks in the foreground for the life of the VM (it
+# returns once the guest is up), so whichever script actually ends the VM
+# - bin/vm-halt or bin/vm-stop - is responsible for this instead. Fails
+# without detaching if qemu is still running when the timeout is reached,
+# since the volume must stay mounted for as long as it's in use.
+wait_for_exit_and_detach() {
+    wait_for_pid_exit "${VM_PID}" "$1" ||
+        fail "VM \"${VM_NAME}\" (pid ${VM_PID}) hasn't exited after $1s. Leaving the volume mounted since qemu is still running."
+    rm -f "${PID_FILE}"
+    hdiutil detach "${VM_DIR}" >/dev/null 2>&1 ||
+        warn "Could not detach ${VM_DIR}; you may need to run: hdiutil detach \"${VM_DIR}\""
+}

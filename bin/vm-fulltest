@@ -1,0 +1,222 @@
+#!/bin/sh
+#
+# vm-fulltest [config file] - end-to-end smoke test for the whole
+# vm-<verb> toolkit. Destroys any existing VM with the same name as the
+# config file's NAME (stops it, detaches its mount, deletes its bundle),
+# builds a fresh one with vm-init, starts it, and exercises every
+# control script against it, asserting the expected result at each step.
+#
+# Defaults to ../example.vmc, which builds a VM named "vm" - only run
+# this against a disposable test VM, never one you care about keeping.
+#
+# Exits 0 only if every assertion passed.
+
+set -eu
+BIN_DIR="$(cd "$(dirname "${0}")" && pwd)"
+REPO_DIR="$(cd "${BIN_DIR}/.." && pwd)"
+. "${BIN_DIR}/vm-lib"
+
+CONFIG_FILE="${1:-${REPO_DIR}/example.vmc}"
+[ -f "${CONFIG_FILE}" ] ||
+    fail "Config file not found: ${CONFIG_FILE}"
+TEST_VM_NAME="$(awk -F= '$1 == "NAME" {print $2}' "${CONFIG_FILE}")"
+[ -n "${TEST_VM_NAME}" ] ||
+    fail "Could not determine NAME from ${CONFIG_FILE}"
+
+PASS=0
+FAIL=0
+
+step() {
+    printf '\n=== %s ===\n' "$*"
+}
+
+ok() {
+    PASS=$((PASS + 1))
+    printf 'PASS: %s\n' "$*"
+}
+
+bad() {
+    FAIL=$((FAIL + 1))
+    printf 'FAIL: %s\n' "$*" >&2
+}
+
+# Runs a command, recording PASS/FAIL under the given description.
+# Wrapped in an explicit if so a nonzero exit is a recorded failure, not
+# a script-ending error under `set -e`.
+require() {
+    _desc="$1"; shift
+    if "$@" ; then
+        ok "${_desc}"
+    else
+        bad "${_desc}"
+    fi
+}
+
+# Fetches the guest's run-state directly over QMP (independent of
+# bin/vm-status's own output), for assertions.
+qmp_query_status() {
+    qmp_send '{"execute":"query-status"}' 2>/dev/null |
+        jq -r 'select(.return != null) | .return.status' 2>/dev/null | tail -n1
+}
+
+resolve_vm "${TEST_VM_NAME}"
+
+# --------------------------------------------------------------- CLEANUP
+step "Cleaning up any existing VM named \"${TEST_VM_NAME}\""
+
+if vm_is_running ; then
+    printf ' - Found a running VM (pid %s) - stopping it.\n' "${VM_PID}"
+    "${BIN_DIR}/vm-stop" "${TEST_VM_NAME}" || true
+fi
+
+if [ -e "${VM_DIR}" ] ; then
+    printf ' - Detaching leftover mount(%s)\n' "${VM_DIR}"
+    hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || sudo hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
+fi
+
+if [ -e "${BUNDLE_PATH}" ] ; then
+    printf ' - Removing existing bundle(%s)\n' "${BUNDLE_PATH}"
+    sudo rm -rf "${BUNDLE_PATH}"
+fi
+
+if [ -e "${RUN_DIR}" ] ; then
+    printf ' - Removing leftover run directory(%s)\n' "${RUN_DIR}"
+    sudo rm -rf "${RUN_DIR}"
+fi
+
+# ------------------------------------------------------------------ INIT
+# vm-init now bakes a golden image itself (boots once with cloud-init's
+# seed attached, waits for the guest agent, shuts down, flattens the
+# disk), so this alone can take several minutes on a first run - that's
+# all inside vm-init's own timeout (VM_BAKE_TIMEOUT), not this script's.
+step "vm-init ${CONFIG_FILE}"
+require "vm-init exits 0" "${BIN_DIR}/vm-init" "${CONFIG_FILE}"
+require "bundle exists after vm-init" [ -e "${BUNDLE_PATH}" ]
+require "bundle is detached after vm-init" [ ! -e "${VM_DIR}" ]
+
+step "Verifying golden image contents"
+hdiutil attach "${BUNDLE_PATH}" -mountpoint "${VM_DIR}" >/dev/null
+require "virtual-hard-disk has no backing file (flattened)" \
+    sh -c "! qemu-img info '${VM_DIR}/virtual-hard-disk' | grep -qi 'backing file'"
+require "cidata.iso removed after baking" [ ! -e "${VM_DIR}/cidata.iso" ]
+require "base image removed after baking" [ ! -e "${VM_DIR}/images" ]
+hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
+
+# ----------------------------------------------------------- START (1st)
+# The golden disk has no cloud-init seed attached, so this should just be
+# an ordinary boot of an already-configured OS - no provisioning, no
+# package installs. Give it a moderate budget rather than assuming a
+# specific speedup, since that's part of what this test is meant to show.
+step "vm-start ${TEST_VM_NAME}"
+VM_START_TIMEOUT="${VM_FULLTEST_BOOT_TIMEOUT:-240}"
+export VM_START_TIMEOUT
+require "vm-start exits 0 (guest responded within ${VM_START_TIMEOUT}s)" \
+    "${BIN_DIR}/vm-start" "${TEST_VM_NAME}"
+require "bundle is mounted while VM runs" [ -e "${VM_DIR}" ]
+require "VM shows running" vm_is_running
+
+# --------------------------------------------------------------- STATUS
+step "vm-status ${TEST_VM_NAME}"
+STATUS_OUT="$("${BIN_DIR}/vm-status" "${TEST_VM_NAME}" 2>&1)" || true
+printf '%s\n' "${STATUS_OUT}"
+if printf '%s\n' "${STATUS_OUT}" | grep -qi "running" ; then
+    ok "vm-status reports running"
+else
+    bad "vm-status did not report running: ${STATUS_OUT}"
+fi
+
+# ---------------------------------------------------------------- PAUSE
+step "vm-pause ${TEST_VM_NAME}"
+require "vm-pause exits 0" "${BIN_DIR}/vm-pause" "${TEST_VM_NAME}"
+STATE="$(qmp_query_status)"
+if [ "${STATE}" = "paused" ] ; then
+    ok "guest state is paused (QMP query-status)"
+else
+    bad "expected guest state 'paused', got '${STATE}'"
+fi
+STATUS_OUT="$("${BIN_DIR}/vm-status" "${TEST_VM_NAME}" 2>&1)" || true
+if printf '%s\n' "${STATUS_OUT}" | grep -qi "paused" ; then
+    ok "vm-status reports paused"
+else
+    bad "vm-status did not report paused: ${STATUS_OUT}"
+fi
+
+# --------------------------------------------------------------- RESUME
+step "vm-resume ${TEST_VM_NAME}"
+require "vm-resume exits 0" "${BIN_DIR}/vm-resume" "${TEST_VM_NAME}"
+STATE="$(qmp_query_status)"
+if [ "${STATE}" = "running" ] ; then
+    ok "guest state is running again (QMP query-status)"
+else
+    bad "expected guest state 'running', got '${STATE}'"
+fi
+
+# -------------------------------------------------------------- RESTART
+step "vm-restart ${TEST_VM_NAME}"
+vm_is_running || fail "VM unexpectedly not running before vm-restart"
+PID_BEFORE_RESTART="${VM_PID}"
+require "vm-restart exits 0" "${BIN_DIR}/vm-restart" "${TEST_VM_NAME}"
+
+printf ' - Waiting for guest agent to come back up after reset...\n'
+RESTART_TIMEOUT="${VM_FULLTEST_RESTART_TIMEOUT:-240}"
+ELAPSED=0
+BACK=0
+while [ "${ELAPSED}" -lt "${RESTART_TIMEOUT}" ] ; do
+    if qga_ping 2 ; then
+        BACK=1
+        break
+    fi
+    sleep 3
+    ELAPSED=$((ELAPSED + 3))
+    printf '.'
+done
+printf '\n'
+if [ "${BACK}" -eq 1 ] ; then
+    ok "guest agent responded again after reset (~${ELAPSED}s)"
+else
+    bad "guest agent did not respond within ${RESTART_TIMEOUT}s after reset"
+fi
+
+if vm_is_running && [ "${VM_PID}" = "${PID_BEFORE_RESTART}" ] ; then
+    ok "qemu pid unchanged across restart (${VM_PID}) - only the guest rebooted"
+else
+    bad "qemu pid changed or vanished across restart (was ${PID_BEFORE_RESTART})"
+fi
+
+# ----------------------------------------------------------------- HALT
+step "vm-halt ${TEST_VM_NAME}"
+VM_HALT_TIMEOUT="${VM_FULLTEST_HALT_TIMEOUT:-120}"
+export VM_HALT_TIMEOUT
+require "vm-halt exits 0 (guest powered off within ${VM_HALT_TIMEOUT}s)" \
+    "${BIN_DIR}/vm-halt" "${TEST_VM_NAME}"
+if vm_is_running ; then
+    bad "VM still shows running after vm-halt"
+else
+    ok "VM no longer running after vm-halt"
+fi
+require "bundle detached after vm-halt" [ ! -e "${VM_DIR}" ]
+
+# ----------------------------------------------------------- START (2nd)
+step "vm-start ${TEST_VM_NAME} (second boot)"
+VM_START_TIMEOUT="${VM_FULLTEST_BOOT_TIMEOUT:-240}"
+export VM_START_TIMEOUT
+require "vm-start exits 0 (guest responded within ${VM_START_TIMEOUT}s)" \
+    "${BIN_DIR}/vm-start" "${TEST_VM_NAME}"
+
+# ----------------------------------------------------------------- STOP
+step "vm-stop ${TEST_VM_NAME}"
+VM_STOP_TIMEOUT="${VM_FULLTEST_STOP_TIMEOUT:-30}"
+export VM_STOP_TIMEOUT
+require "vm-stop exits 0 (qemu exited within ${VM_STOP_TIMEOUT}s)" \
+    "${BIN_DIR}/vm-stop" "${TEST_VM_NAME}"
+if vm_is_running ; then
+    bad "VM still shows running after vm-stop"
+else
+    ok "VM no longer running after vm-stop"
+fi
+require "bundle detached after vm-stop" [ ! -e "${VM_DIR}" ]
+
+# -------------------------------------------------------------- SUMMARY
+step "Summary"
+printf '%d passed, %d failed\n' "${PASS}" "${FAIL}"
+[ "${FAIL}" -eq 0 ]
