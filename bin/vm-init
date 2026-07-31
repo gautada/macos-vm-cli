@@ -45,6 +45,21 @@ load_vm_variable() {
     unset ${_key}
 }
 
+# Like load_vm_variable, but if the config didn't set it (or set it
+# empty), uses the given default instead of failing. Used for fields
+# that are new (like NETMODE) so existing .vmc files without them keep
+# working unchanged, and for fields that only matter in some modes.
+load_vm_variable_default() {
+    _key="${1:?}"
+    _default="${2:?}"
+    _val="${!_key:-}"
+    [ -n "${_val}" ] || _val="${_default}"
+    _target="VM_${_key}"
+    export "${_target}=${_val}"
+    printf ' - - Variable: %s=%s\n' "${_target}" "${_val}"
+    unset ${_key} 2>/dev/null || true
+}
+
 # Given a size like "80G" or "512M", print the size in whole gigabytes,
 # rounding up. Used to size the sparsebundle relative to the configured
 # guest disk size.
@@ -85,18 +100,53 @@ set -a
 # shellcheck disable=SC1090
 . "${CONFIG_FILE}"
 set +a
-# Every field in the config file is required; load_vm_variable fails fast
-# if any is missing, rather than building a half-configured VM.
+# Every field in the config file is required unless noted otherwise;
+# load_vm_variable fails fast if any is missing, rather than building a
+# half-configured VM.
 load_vm_variable "NAME"
 load_vm_variable "INSTANCE"
 load_vm_variable "DOMAIN"
 load_vm_variable "CPUS"
 load_vm_variable "MEMORY"
 load_vm_variable "DISK"
-load_vm_variable "IP"
 load_vm_variable "MAC"
-load_vm_variable "GATEWAY"
 load_vm_variable "OS"
+
+# NETMODE picks the VM's networking backend and (via resolve_vm's
+# location check, for the vm-<verb> scripts) where its state lives:
+#   bridged (default, for compatibility with configs from before this
+#     field existed) - vmnet-bridged onto a real host interface, needing
+#     sudo throughout; shared state at /Users/Shared/qemu.
+#   user - qemu's own usermode/SLIRP networking, fully unprivileged, no
+#     sudo anywhere; state lives entirely under this repo's build/.
+load_vm_variable_default "NETMODE" "bridged"
+case "${VM_NETMODE}" in
+    bridged|user) ;;
+    *) fail "Unsupported NETMODE '${VM_NETMODE}' (expected 'bridged' or 'user')" ;;
+esac
+
+# IP/GATEWAY only matter for bridged mode, where the guest gets a static
+# address on the real network via netplan. In user mode, qemu's SLIRP
+# backend hands out its own address over DHCP, so these fields are
+# irrelevant - validation is mode-aware rather than requiring them
+# unconditionally.
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    load_vm_variable "IP"
+    load_vm_variable "GATEWAY"
+else
+    if [ -n "${IP:-}" ] || [ -n "${GATEWAY:-}" ] ; then
+        warn "IP/GATEWAY are ignored in NETMODE=user (SLIRP assigns its own address over DHCP)"
+    fi
+    unset IP GATEWAY 2>/dev/null || true
+fi
+
+# Where this VM's state lives, chosen by NETMODE - see the comment on
+# QEMU_DIR_BRIDGED/QEMU_DIR_USER in bin/vm-lib for why.
+case "${VM_NETMODE}" in
+    bridged) QEMU_DIR="${QEMU_DIR_BRIDGED}" ;;
+    user)    QEMU_DIR="${QEMU_DIR_USER}" ;;
+esac
+VMS_DIR="${QEMU_DIR}/vms"
 
 # Resolve the cloud-init templates relative to this script's own location
 # (not the caller's cwd, and not a copy under /Users/Shared/qemu). The
@@ -107,14 +157,22 @@ REPO_TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 [ -d "${REPO_TEMPLATES_DIR}" ] ||
     fail "Templates directory not found: ${REPO_TEMPLATES_DIR}"
 
-# /Users/Shared/qemu is shared, host-wide state (not owned by this repo
-# checkout), so it's created/chowned with sudo the first time and reused
-# by every VM. It holds two things:
+# QEMU_DIR holds two things, regardless of mode:
 #   vms/    - one <name>.sparsebundle package per VM (the actual VMs)
 #   cache/  - downloaded base OS images, shared across VMs of the same OS
 #             release so re-running vm-init doesn't re-download each time
-sudo mkdir -p "${QEMU_DIR}"
-sudo chown -R "${USER}":staff "${QEMU_DIR}"
+#
+# In bridged mode this is /Users/Shared/qemu - shared, host-wide state
+# not owned by this repo checkout, so it's created/chowned with sudo the
+# first time and reused by every VM. In user mode it's this repo's own
+# build/ directory - already owned by the plain user, so no sudo is
+# needed (or used) to set it up.
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    sudo mkdir -p "${QEMU_DIR}"
+    sudo chown -R "${USER}":staff "${QEMU_DIR}"
+else
+    mkdir -p "${QEMU_DIR}"
+fi
 # VM bundle location
 mkdir -p "${VMS_DIR}"
 # Shared download cache for base OS images, so re-running vm-init for
@@ -183,7 +241,7 @@ cleanup() {
     [ -z "${KEEPALIVE_PID}" ] || kill "${KEEPALIVE_PID}" 2>/dev/null || true
     if [ -n "${BAKE_PID}" ] && ps -p "${BAKE_PID}" >/dev/null 2>&1 ; then
         warn "Stopping bake-boot qemu process(pid ${BAKE_PID})"
-        sudo kill "${BAKE_PID}" 2>/dev/null || true
+        run_as "$(pid_owner "${BAKE_PID}")" kill "${BAKE_PID}" 2>/dev/null || true
         wait_for_pid_exit "${BAKE_PID}" 30 || true
     fi
     hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
@@ -294,6 +352,27 @@ printf '\n\n\n'
 # Build the cloud-init "NoCloud" seed: meta-data, network-config, and
 # user-data, rendered from templates/ with this VM's settings, then
 # packaged into an ISO the guest reads on first (and every) boot.
+#
+# network-config and user-data both come in two variants, picked by
+# NETMODE (envsubst has no conditionals, so this can't be one template):
+#   bridged - templates/network-config (static IP/GATEWAY via netplan)
+#             + templates/user-data (full package list, updates/upgrades)
+#   user    - templates/network-config-dhcp (SLIRP hands out an address)
+#             + templates/user-data-fast (trimmed packages, no
+#             package_update/package_upgrade - this project's owner
+#             explicitly asked for a fast profile in user mode, since
+#             it's meant for quick, repeated debug-loop rebuilds, not
+#             production fidelity)
+case "${VM_NETMODE}" in
+    bridged)
+        NETWORK_CONFIG_TEMPLATE="network-config"
+        USER_DATA_TEMPLATE="user-data"
+        ;;
+    user)
+        NETWORK_CONFIG_TEMPLATE="network-config-dhcp"
+        USER_DATA_TEMPLATE="user-data-fast"
+        ;;
+esac
 TEMP_DIR="$(mktemp -d)"
 # VM_BUILD is a unique-per-build instance id. cloud-init only re-runs its
 # setup for an instance-id it hasn't seen before, so this forces a fresh
@@ -302,14 +381,19 @@ TEMP_DIR="$(mktemp -d)"
 VM_BUILD="$(printf '%x\n' "$(date +%s)")"
 export VM_BUILD
 envsubst < "${REPO_TEMPLATES_DIR}/meta-data" > "${TEMP_DIR}/meta-data"
-envsubst < "${REPO_TEMPLATES_DIR}/network-config" > "${TEMP_DIR}/network-config"
+envsubst < "${REPO_TEMPLATES_DIR}/${NETWORK_CONFIG_TEMPLATE}" > "${TEMP_DIR}/network-config"
 # Bake in the operator's own SSH public key so the guest is reachable
-# immediately after boot without any manual console access.
-VM_SSH="$(cat "$HOME/.config/ssh/id_ed25519.pub")"
-export VM_SSH
-envsubst < "${REPO_TEMPLATES_DIR}/user-data" > "${TEMP_DIR}/user-data"
+# immediately after boot without any manual console access. NOTE: this
+# must be named to match templates/user-data*'s own placeholder
+# (${VM_SSH_PUBLIC_KEY}) exactly - envsubst silently substitutes an unset
+# variable with an empty string rather than failing, so a name mismatch
+# here previously produced a guest with no authorized key and no way to
+# log in at all, without any error anywhere.
+VM_SSH_PUBLIC_KEY="$(cat "$HOME/.config/ssh/id_ed25519.pub")"
+export VM_SSH_PUBLIC_KEY
+envsubst < "${REPO_TEMPLATES_DIR}/${USER_DATA_TEMPLATE}" > "${TEMP_DIR}/user-data"
 unset VM_BUILD
-unset VM_SSH
+unset VM_SSH_PUBLIC_KEY
 CIDATA_FILE="${VM_DIR}/cidata"
 # hdiutil makehybrid -iso appends .iso automatically, producing
 # cidata.iso - only needed for the bake boot below, not by bin/vm-start.
@@ -337,13 +421,20 @@ QEMU="/opt/homebrew/bin/qemu-system-aarch64"
 
 # Needed for both the qemu launch and the guest-agent polling below; kept
 # refreshed in the background since this boot (cloud-init installing and
-# upgrading packages) can take several minutes.
-sudo -v
-( while true ; do sudo -n -v 2>/dev/null ; sleep 60 ; done ) &
-KEEPALIVE_PID=$!
+# upgrading packages) can take several minutes. Only bridged mode's qemu
+# runs under sudo at all - user mode needs (and uses) no sudo anywhere.
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    sudo -v
+    ( while true ; do sudo -n -v 2>/dev/null ; sleep 60 ; done ) &
+    KEEPALIVE_PID=$!
+fi
 
-printf ' - Booting to let cloud-init provision the disk (this can take several minutes)...\n'
-nohup sudo "$QEMU" \
+printf ' - Booting to let cloud-init provision the disk (this can take a while)...\n'
+# Build the full qemu argv as positional params ($@) instead of
+# duplicating the whole invocation once per NETMODE/sudo branch - each
+# branch below just appends its own bit with `set -- "$@" ...` so the
+# sudo/no-sudo launch choice only has to be made once, at the very end.
+set -- \
   -name "${VM_NAME}" \
   -machine virt,accel=hvf,highmem=on \
   -cpu host \
@@ -356,11 +447,30 @@ nohup sudo "$QEMU" \
   -device virtio-blk-pci,drive=osdisk \
   \
   -drive if=none,id=seed,format=raw,readonly=on,file="${CIDATA_FILE}.iso" \
-  -device virtio-blk-pci,drive=seed \
-  \
-  -netdev vmnet-bridged,id=net0,ifname=en1 \
-  -device virtio-net-pci,netdev=net0,mac="${VM_MAC}" \
-  \
+  -device virtio-blk-pci,drive=seed
+
+# Networking backend, chosen by NETMODE:
+#   bridged - vmnet-bridged onto a real host interface, needing sudo.
+#   user    - qemu's own usermode/SLIRP networking, fully unprivileged.
+#             hostfwd exposes the guest's sshd on a host port derived
+#             from INSTANCE, since SLIRP gives the guest an address
+#             that's only reachable from qemu itself, not the host -
+#             without this there'd be no way to reach the guest at all
+#             (handy for this project's owner debugging a hung boot: it
+#             means SSH is actually usable even in user mode).
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    set -- "$@" \
+      -netdev vmnet-bridged,id=net0,ifname=en1 \
+      -device virtio-net-pci,netdev=net0,mac="${VM_MAC}"
+else
+    SSH_HOST_PORT=$((20000 + 10#${VM_INSTANCE}))
+    printf ' - - NETMODE=user: guest sshd will be reachable at localhost:%s\n' "${SSH_HOST_PORT}"
+    set -- "$@" \
+      -netdev user,id=net0,hostfwd=tcp::"${SSH_HOST_PORT}"-:22 \
+      -device virtio-net-pci,netdev=net0,mac="${VM_MAC}"
+fi
+
+set -- "$@" \
   -chardev socket,id=qga0,path="${QGA_SOCKET}",server=on,wait=off \
   -device virtio-serial-pci \
   -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
@@ -372,8 +482,13 @@ nohup sudo "$QEMU" \
   -monitor none \
   -display none \
   \
-  -device virtio-rng-pci \
-  </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+  -device virtio-rng-pci
+
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    nohup sudo "$QEMU" "$@" </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+else
+    nohup "$QEMU" "$@" </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+fi
 BAKE_PID=$!
 disown 2>/dev/null || true
 printf '%s\n' "${BAKE_PID}" > "${PID_FILE}"
@@ -384,19 +499,7 @@ ps -p "${BAKE_PID}" >/dev/null 2>&1 ||
 
 BAKE_TIMEOUT="${VM_BAKE_TIMEOUT:-900}"
 printf ' - Waiting for guest agent to respond (up to %ss)\n' "${BAKE_TIMEOUT}"
-ELAPSED=0
-READY=0
-while [ "${ELAPSED}" -lt "${BAKE_TIMEOUT}" ] ; do
-    if qga_ping 2 ; then
-        READY=1
-        break
-    fi
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
-    printf '.'
-done
-printf '\n'
-[ "${READY}" -eq 1 ] ||
+wait_for_qga_ready "${BAKE_TIMEOUT}" 5 ||
     fail "Guest agent didn't respond within ${BAKE_TIMEOUT}s during bake boot - see ${RUN_DIR}/qemu.log and ${SERIAL_LOG}"
 printf ' - Guest is up and cloud-init has provisioned the disk.\n'
 

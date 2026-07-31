@@ -1,0 +1,4 @@
+# NETMODE=user VMs live entirely under here (sparsebundles, run-time
+# sockets/pidfiles/logs, cached base images) - this is host-local state,
+# not part of the toolkit itself. See README.md and bin/vm-lib.
+/build/

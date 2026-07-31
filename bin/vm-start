@@ -86,22 +86,25 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Both the qemu launch and the guest-agent polling below need sudo.
-# Authenticate once up front, then keep the ticket refreshed in the
-# background for the rest of this script - otherwise a slow first boot
-# (cloud-init installing packages) could hit repeated password prompts as
-# the cached ticket expires mid-poll.
-sudo -v
-( while true ; do sudo -n -v 2>/dev/null ; sleep 60 ; done ) &
-KEEPALIVE_PID=$!
+# VM_NETMODE was determined by resolve_vm above from which of the two
+# known VM locations this bundle actually lives in (see bin/vm-lib) -
+# that's the source of truth here, not re-derived from the config file.
+# Only bridged mode's qemu (and the guest-agent polling below) needs
+# sudo at all; user mode runs entirely unprivileged. Authenticate once
+# up front and keep the ticket refreshed in the background for the rest
+# of this script - otherwise a slow first boot could hit repeated
+# password prompts as the cached ticket expires mid-poll.
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    sudo -v
+    ( while true ; do sudo -n -v 2>/dev/null ; sleep 60 ; done ) &
+    KEEPALIVE_PID=$!
+fi
 
-# -display none / -monitor none / dropping the old mon:stdio serial keep
-# it fully headless; the serial console is still reachable, just over a
-# socket instead of this terminal (see SERIAL_SOCKET in README.md), for
-# debugging. nohup + redirected stdio detach it from this terminal at the
-# OS level; disown drops it from this shell's job table so a later `wait`
-# or job-control action here can't affect it.
-nohup sudo "$QEMU" \
+# Build the full qemu argv as positional params ($@) instead of
+# duplicating the whole invocation once per NETMODE/sudo branch - each
+# branch below just appends its own bit with `set -- "$@" ...` so the
+# sudo/no-sudo launch choice only has to be made once, at the very end.
+set -- \
   -name "${VM_NAME}" \
   -machine virt,accel=hvf,highmem=on \
   -cpu host \
@@ -111,11 +114,25 @@ nohup sudo "$QEMU" \
   -drive if=pflash,format=raw,readonly=on,file="${VM_DIR}/firmware" \
   -drive if=pflash,format=raw,file="${VM_DIR}/bios" \
   -drive if=none,id=osdisk,format=qcow2,file="${VM_DIR}/virtual-hard-disk" \
-  -device virtio-blk-pci,drive=osdisk \
-  \
-  -netdev vmnet-bridged,id=net0,ifname=en1 \
-  -device virtio-net-pci,netdev=net0,mac="${MAC}" \
-  \
+  -device virtio-blk-pci,drive=osdisk
+
+# Networking backend, chosen by NETMODE - see bin/vm-init for the full
+# rationale. hostfwd in user mode exposes the guest's sshd on a host
+# port derived from INSTANCE, since SLIRP's guest address isn't
+# otherwise reachable from the host at all.
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    set -- "$@" \
+      -netdev vmnet-bridged,id=net0,ifname=en1 \
+      -device virtio-net-pci,netdev=net0,mac="${MAC}"
+else
+    SSH_HOST_PORT=$((20000 + 10#${INSTANCE}))
+    printf ' - - NETMODE=user: guest sshd will be reachable at localhost:%s\n' "${SSH_HOST_PORT}"
+    set -- "$@" \
+      -netdev user,id=net0,hostfwd=tcp::"${SSH_HOST_PORT}"-:22 \
+      -device virtio-net-pci,netdev=net0,mac="${MAC}"
+fi
+
+set -- "$@" \
   -chardev socket,id=qga0,path="${QGA_SOCKET}",server=on,wait=off \
   -device virtio-serial-pci \
   -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
@@ -127,8 +144,19 @@ nohup sudo "$QEMU" \
   -monitor none \
   -display none \
   \
-  -device virtio-rng-pci \
-  </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+  -device virtio-rng-pci
+
+# -display none / -monitor none / dropping the old mon:stdio serial keep
+# it fully headless; the serial console is still reachable, just over a
+# socket instead of this terminal (see SERIAL_SOCKET in README.md), for
+# debugging. nohup + redirected stdio detach it from this terminal at the
+# OS level; disown drops it from this shell's job table so a later `wait`
+# or job-control action here can't affect it.
+if [ "${VM_NETMODE}" = "bridged" ] ; then
+    nohup sudo "$QEMU" "$@" </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+else
+    nohup "$QEMU" "$@" </dev/null >>"${RUN_DIR}/qemu.log" 2>&1 &
+fi
 QEMU_PID=$!
 disown 2>/dev/null || true
 
@@ -151,20 +179,12 @@ printf ' - qemu started(pid %s)\n' "${VM_PID}"
 
 # --------------------------------------------------------------- WAIT-READY
 WAIT_TIMEOUT="${VM_START_TIMEOUT:-180}"
-WAIT_INTERVAL=3
 printf ' - Waiting for guest agent to respond (up to %ss; Ctrl-C stops waiting, VM keeps running)\n' "${WAIT_TIMEOUT}"
-ELAPSED=0
-READY=0
-while [ "${ELAPSED}" -lt "${WAIT_TIMEOUT}" ] ; do
-    if qga_ping 2 ; then
-        READY=1
-        break
-    fi
-    sleep "${WAIT_INTERVAL}"
-    ELAPSED=$((ELAPSED + WAIT_INTERVAL))
-    printf '.'
-done
-printf '\n'
+if wait_for_qga_ready "${WAIT_TIMEOUT}" 3 ; then
+    READY=1
+else
+    READY=0
+fi
 
 if [ "${READY}" -eq 1 ] ; then
     printf 'VM "%s" is up and responding (pid %s).\n' "${VM_NAME}" "${VM_PID}"

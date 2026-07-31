@@ -14,6 +14,11 @@
 set -eu
 BIN_DIR="$(cd "$(dirname "${0}")" && pwd)"
 REPO_DIR="$(cd "${BIN_DIR}/.." && pwd)"
+# vm-lib expects LIB_DIR (the convention every other vm-<verb> script
+# uses) to already be set before it's sourced, so it can find its own
+# REPO_DIR/build directory - this script names the same thing BIN_DIR,
+# so alias it rather than renaming everything else below.
+LIB_DIR="${BIN_DIR}"
 . "${BIN_DIR}/vm-lib"
 
 CONFIG_FILE="${1:-${REPO_DIR}/example.vmc}"
@@ -22,6 +27,12 @@ CONFIG_FILE="${1:-${REPO_DIR}/example.vmc}"
 TEST_VM_NAME="$(awk -F= '$1 == "NAME" {print $2}' "${CONFIG_FILE}")"
 [ -n "${TEST_VM_NAME}" ] ||
     fail "Could not determine NAME from ${CONFIG_FILE}"
+# Sniffed the same way, and defaulted the same way as bin/vm-init itself
+# defaults a config file without this field - used only as a fallback
+# hint for resolve_vm below, in case this VM has never been built before
+# (so there's genuinely nothing to find in either location yet).
+TEST_VM_NETMODE="$(awk -F= '$1 == "NETMODE" {print $2}' "${CONFIG_FILE}")"
+TEST_VM_NETMODE="${TEST_VM_NETMODE:-bridged}"
 
 PASS=0
 FAIL=0
@@ -59,7 +70,7 @@ qmp_query_status() {
         jq -r 'select(.return != null) | .return.status' 2>/dev/null | tail -n1
 }
 
-resolve_vm "${TEST_VM_NAME}"
+resolve_vm "${TEST_VM_NAME}" "${TEST_VM_NETMODE}"
 
 # --------------------------------------------------------------- CLEANUP
 step "Cleaning up any existing VM named \"${TEST_VM_NAME}\""
@@ -74,14 +85,20 @@ if [ -e "${VM_DIR}" ] ; then
     hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || sudo hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
 fi
 
+# Removal only needs sudo in bridged mode (root-owned bundle/run dir,
+# since qemu itself ran as root) - a user-mode VM's files are all
+# plain-user-owned already, so `rm -rf` alone succeeds and sudo is never
+# invoked. Try plain first, escalate only if that actually fails, same
+# pattern as the hdiutil detach right above - this is what keeps a
+# NETMODE=user run of this whole script from ever prompting for sudo.
 if [ -e "${BUNDLE_PATH}" ] ; then
     printf ' - Removing existing bundle(%s)\n' "${BUNDLE_PATH}"
-    sudo rm -rf "${BUNDLE_PATH}"
+    rm -rf "${BUNDLE_PATH}" 2>/dev/null || sudo rm -rf "${BUNDLE_PATH}"
 fi
 
 if [ -e "${RUN_DIR}" ] ; then
     printf ' - Removing leftover run directory(%s)\n' "${RUN_DIR}"
-    sudo rm -rf "${RUN_DIR}"
+    rm -rf "${RUN_DIR}" 2>/dev/null || sudo rm -rf "${RUN_DIR}"
 fi
 
 # ------------------------------------------------------------------ INIT
@@ -159,20 +176,8 @@ require "vm-restart exits 0" "${BIN_DIR}/vm-restart" "${TEST_VM_NAME}"
 
 printf ' - Waiting for guest agent to come back up after reset...\n'
 RESTART_TIMEOUT="${VM_FULLTEST_RESTART_TIMEOUT:-240}"
-ELAPSED=0
-BACK=0
-while [ "${ELAPSED}" -lt "${RESTART_TIMEOUT}" ] ; do
-    if qga_ping 2 ; then
-        BACK=1
-        break
-    fi
-    sleep 3
-    ELAPSED=$((ELAPSED + 3))
-    printf '.'
-done
-printf '\n'
-if [ "${BACK}" -eq 1 ] ; then
-    ok "guest agent responded again after reset (~${ELAPSED}s)"
+if wait_for_qga_ready "${RESTART_TIMEOUT}" 3 ; then
+    ok "guest agent responded again after reset (within ${RESTART_TIMEOUT}s)"
 else
     bad "guest agent did not respond within ${RESTART_TIMEOUT}s after reset"
 fi

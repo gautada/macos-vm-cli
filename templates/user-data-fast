@@ -1,0 +1,67 @@
+#cloud-config
+#
+# Trimmed cloud-init profile used for NETMODE=user builds. Unlike
+# templates/user-data (the full-fidelity bridged-mode profile), this
+# skips package_update/package_upgrade entirely and only installs the
+# packages actually needed for the guest agent, SSH, and basic
+# diagnostics - openssh-server is already present on the stock Ubuntu
+# cloud image, so it isn't listed again here. This is a deliberate
+# tradeoff: NETMODE=user is meant for fast, repeated debug-loop
+# rebuilds (a bake/boot cycle in the range of 1-2 minutes instead of
+# 5-10+), not production fidelity - NETMODE=bridged keeps the full
+# profile unchanged.
+
+hostname: ${VM_NAME}${VM_INSTANCE}
+fqdn: ${VM_NAME}${VM_INSTANCE}.${VM_DOMAIN}
+prefer_fqdn_over_hostname: false
+manage_etc_hosts: true
+
+timezone: America/New_York
+
+users:
+  - name: ${VM_NAME}
+    gecos: VM User
+    groups:
+      - adm
+      - sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ${VM_SSH_PUBLIC_KEY}
+
+ssh_pwauth: false
+disable_root: true
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-cloud-init-password.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+
+package_update: false
+package_upgrade: false
+
+packages:
+  - qemu-guest-agent
+  - curl
+  - jq
+  - iputils-ping
+
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - sshd -t
+  - systemctl restart ssh
+
+growpart:
+  mode: auto
+  devices:
+    - /
+  ignore_growroot_disabled: false
+
+resize_rootfs: true
+
+final_message: |
+  ***** CLOUD-INIT COMPLETED *****

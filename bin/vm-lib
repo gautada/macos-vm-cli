@@ -1,17 +1,33 @@
 #!/bin/sh
 #
 # vm-lib - shared helpers for the vm-<verb> control scripts (vm-status,
-# vm-halt, vm-stop, vm-restart, vm-pause, vm-resume). Meant to be sourced
-# by those scripts, not executed directly.
+# vm-halt, vm-stop, vm-restart, vm-pause, vm-resume) as well as vm-init,
+# vm-start and vm-fulltest. Meant to be sourced, not executed directly.
 #
-# All control happens over the VM's QMP socket at
-# /Users/Shared/qemu/run/<name>/qmp.sock (created by bin/vm-start). That
-# socket is owned by root because qemu itself runs under sudo (needed for
-# vmnet-bridged networking), so every command here - even a read-only
-# status query - talks to it via `sudo nc -U`.
-
-QEMU_DIR="/Users/Shared/qemu"
-VMS_DIR="${QEMU_DIR}/vms"
+# Every VM runs in one of two network modes, chosen per-VM by the
+# NETMODE field in its .vmc config file (see bin/vm-init):
+#
+#   bridged (default) - -netdev vmnet-bridged, needing raw host network
+#     access, so qemu itself runs under `sudo`, and everything it creates
+#     (sockets, pidfile-worthy state) ends up root-owned. Shared,
+#     host-wide state lives at /Users/Shared/qemu.
+#   user - qemu's own usermode/SLIRP networking (-netdev user), which
+#     needs no special privilege at all - qemu runs as the plain invoking
+#     user, so nothing it creates needs sudo to read or control either.
+#     State lives entirely under this repo checkout, at ./build.
+#
+# bin/vm-init reads NETMODE directly from the config file it's given, so
+# it always knows which location/mode to use up front. The vm-<verb>
+# scripts, though, only ever receive a bare VM *name* - resolve_vm()
+# below is what figures out which of the two locations (and therefore
+# which mode) a given name actually lives in, by checking both.
+#
+# Socket/process ownership is then used to decide, automatically and
+# per-call, whether a given command needs `sudo` - see path_owner(),
+# pid_owner() and run_as() below. This keeps "try without sudo, only
+# escalate if the thing you're touching is actually root-owned" in one
+# place, rather than needing every caller to know and pass the mode
+# through explicitly.
 
 warn() {
     printf 'WARN: %s\n' "$*" >&2
@@ -27,16 +43,101 @@ command -v jq >/dev/null 2>&1 ||
 command -v nc >/dev/null 2>&1 ||
     fail "This script requires 'nc'"
 
+# LIB_DIR is set by every caller (vm-init, vm-start, vm-status, ...)
+# immediately before sourcing this file, as
+# LIB_DIR="$(cd "$(dirname "${0}")" && pwd)" - that assignment runs in
+# this same shell (sourcing, not exec), so it's already in scope here.
+REPO_DIR="$(cd "${LIB_DIR}/.." && pwd)"
+
+# Bridged mode: today's original behavior. Shared, host-wide location,
+# root-owned because qemu itself runs under sudo for vmnet-bridged.
+QEMU_DIR_BRIDGED="/Users/Shared/qemu"
+VMS_DIR_BRIDGED="${QEMU_DIR_BRIDGED}/vms"
+
+# User mode: fully unprivileged. Lives entirely inside this repo
+# checkout so nothing outside it - and no sudo - is ever required.
+QEMU_DIR_USER="${REPO_DIR}/build"
+VMS_DIR_USER="${QEMU_DIR_USER}/vms"
+
+# Prints the username that owns the given path (file or directory), or
+# nothing if it doesn't exist / can't be stat'd.
+path_owner() {
+    stat -f '%Su' "$1" 2>/dev/null
+}
+
+# Prints the username that owns the given running pid, or nothing if
+# it's not currently running.
+pid_owner() {
+    ps -o user= -p "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+# Runs "$@", prefixed with sudo only if the given owner is "root" and we
+# aren't already root ourselves. This is the single place that decides
+# "does touching this thing need sudo" - every socket/process
+# interaction in this library goes through it instead of hardcoding
+# sudo, so a user-mode VM (everything plain-user-owned, since qemu itself
+# runs unprivileged) never invokes sudo at all, while a bridged-mode VM
+# (qemu running as root) keeps working exactly as before.
+run_as() {
+    _owner="$1"; shift
+    if [ "${_owner}" = "root" ] && [ "$(id -u)" -ne 0 ] ; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
 # Resolves a VM name into its paths, without requiring it to be running.
-# Sets: VM_NAME, BUNDLE_PATH, VM_DIR, RUN_DIR, PID_FILE, QMP_SOCKET,
-# QGA_SOCKET, SERIAL_SOCKET, SERIAL_LOG.
+# Checks both the bridged and user-mode VM locations and uses whichever
+# one actually has this VM, so the vm-<verb> scripts (which only ever
+# get a bare name, never the original .vmc) don't need to be told which
+# mode a VM was built in.
+#
+# An optional second argument is a fallback NETMODE ("bridged" or
+# "user") to assume if the bundle doesn't exist in EITHER location,
+# instead of failing outright - for callers like bin/vm-fulltest that
+# need to compute a VM's paths before it's necessarily been built yet
+# (e.g. to clean up nothing on a truly first-ever run), and who - unlike
+# the vm-<verb> scripts - do have the original .vmc config to read a
+# real NETMODE from rather than guessing. Without this second argument,
+# a VM that doesn't exist anywhere is still a hard failure, since for
+# vm-status/vm-halt/etc a bare name with no bundle really is an error.
+#
+# Sets: VM_NAME, VM_NETMODE, QEMU_DIR, VMS_DIR, BUNDLE_PATH, VM_DIR,
+# RUN_DIR, PID_FILE, QMP_SOCKET, QGA_SOCKET, SERIAL_SOCKET, SERIAL_LOG.
 resolve_vm() {
     VM_NAME="${1:-}"
+    _fallback_mode="${2:-}"
     [ -n "${VM_NAME}" ] ||
         fail "Usage: ${0} <vm name>"
-    BUNDLE_PATH="${VMS_DIR}/${VM_NAME}.sparsebundle"
-    [ -e "${BUNDLE_PATH}" ] ||
-        fail "No VM bundle found(${BUNDLE_PATH}). Run bin/vm-init first."
+
+    _bridged_bundle="${VMS_DIR_BRIDGED}/${VM_NAME}.sparsebundle"
+    _user_bundle="${VMS_DIR_USER}/${VM_NAME}.sparsebundle"
+
+    if [ -e "${_bridged_bundle}" ] && [ -e "${_user_bundle}" ] ; then
+        fail "VM \"${VM_NAME}\" exists in both bridged(${_bridged_bundle}) and user(${_user_bundle}) locations - remove one before continuing."
+    elif [ -e "${_bridged_bundle}" ] ; then
+        VM_NETMODE="bridged"
+        QEMU_DIR="${QEMU_DIR_BRIDGED}"
+        VMS_DIR="${VMS_DIR_BRIDGED}"
+        BUNDLE_PATH="${_bridged_bundle}"
+    elif [ -e "${_user_bundle}" ] ; then
+        VM_NETMODE="user"
+        QEMU_DIR="${QEMU_DIR_USER}"
+        VMS_DIR="${VMS_DIR_USER}"
+        BUNDLE_PATH="${_user_bundle}"
+    elif [ -n "${_fallback_mode}" ] ; then
+        case "${_fallback_mode}" in
+            bridged) QEMU_DIR="${QEMU_DIR_BRIDGED}" ;;
+            user)    QEMU_DIR="${QEMU_DIR_USER}" ;;
+            *) fail "Invalid resolve_vm fallback mode '${_fallback_mode}' (expected 'bridged' or 'user')" ;;
+        esac
+        VM_NETMODE="${_fallback_mode}"
+        VMS_DIR="${QEMU_DIR}/vms"
+        BUNDLE_PATH="${VMS_DIR}/${VM_NAME}.sparsebundle"
+    else
+        fail "No VM bundle found for \"${VM_NAME}\" (looked in ${_bridged_bundle} and ${_user_bundle}). Run bin/vm-init first."
+    fi
 
     VM_DIR="/Volumes/${VM_NAME}"
     RUN_DIR="${QEMU_DIR}/run/${VM_NAME}"
@@ -73,6 +174,10 @@ require_running_vm() {
 # e.g. by require_running_vm), and prints the raw newline-delimited JSON
 # responses. The trailing sleep gives qemu a moment to reply before nc's
 # own idle timeout closes the connection.
+#
+# Whether this needs sudo is decided fresh on every call by checking who
+# actually owns the socket (see run_as) - a bridged VM's root-owned
+# socket needs it, a user-mode VM's plain-user-owned socket doesn't.
 qmp_send() {
     {
         printf '%s\n' '{"execute":"qmp_capabilities"}'
@@ -80,7 +185,7 @@ qmp_send() {
             printf '%s\n' "${_cmd}"
         done
         sleep 1
-    } | sudo nc -U -w 3 "${QMP_SOCKET}"
+    } | run_as "$(path_owner "${QMP_SOCKET}")" nc -U -w 3 "${QMP_SOCKET}"
 }
 
 # Sends a single QMP command and fails with qemu's own error message if
@@ -96,17 +201,108 @@ qmp_run() {
 # Sends a single command to the guest agent (QGA_SOCKET must already be
 # set) and prints its raw reply. Unlike QMP, the guest agent protocol
 # needs no capabilities handshake - commands can be sent as soon as it's
-# connected to.
+# connected to. Sudo is decided the same way as qmp_send, above.
+#
+# NOTE: prefer wait_for_qga_ready (below) over calling this in a polling
+# loop - see the comment on that function for why.
 qga_send() {
-    printf '%s\n' "$1" | sudo nc -U -w "${2:-3}" "${QGA_SOCKET}"
+    printf '%s\n' "$1" | run_as "$(path_owner "${QGA_SOCKET}")" nc -U -w "${2:-3}" "${QGA_SOCKET}"
 }
 
 # Returns success if the guest agent answers a ping within the given
-# per-attempt timeout in seconds (default 3). Used to poll for the guest
-# actually being up, not just qemu itself running.
+# per-attempt timeout in seconds (default 3). A single one-shot check;
+# see wait_for_qga_ready for polling.
 qga_ping() {
     _reply="$(qga_send '{"execute":"guest-ping"}' "${1:-3}" 2>/dev/null)"
     printf '%s\n' "${_reply}" | jq -e 'select(.return != null)' >/dev/null 2>&1
+}
+
+# Waits up to $1 seconds (polling every $2, default 3s) for the guest
+# agent to answer a guest-ping, printing a "." per attempt like the
+# old per-attempt-reconnect loops did. Returns success (0) if it
+# answered in time, failure (1) on timeout.
+#
+# This intentionally holds ONE long-lived connection to QGA_SOCKET open
+# for the whole wait, instead of reconnecting fresh for every attempt
+# (which is what a naive `while ! qga_ping; do sleep; done` loop does).
+# That distinction is the actual fix for this project's mystery
+# guest-agent hang: qemu's virtio-serial port only has one "host peer"
+# slot, and disconnecting/reconnecting it - especially before the guest
+# has even booted far enough for qemu-ga to open its end - was observed
+# (via templates/*, serial.log evidence) to occasionally leave the port
+# wedged for the rest of that boot, with qemu-guest-agent's systemd unit
+# reporting "started" but never actually answering anything again, no
+# matter how long you keep polling or how many times you reconnect.
+# Holding a single connection open for the entire wait means the guest
+# never sees more than one connect event, so it can't get desynced by
+# reconnect churn. Any bytes written before qemu-ga is actually listening
+# just sit buffered in the virtio queue until it opens the port.
+wait_for_qga_ready() {
+    _timeout="$1"
+    _interval="${2:-3}"
+    _owner="$(path_owner "${QGA_SOCKET}")"
+
+    _fifo="$(mktemp -u "${TMPDIR:-/tmp}/vm-qga.XXXXXX")"
+    mkfifo "${_fifo}" || fail "Could not create fifo(${_fifo})"
+    _out="$(mktemp "${TMPDIR:-/tmp}/vm-qga-out.XXXXXX")"
+
+    _nc_pid=""
+    _start_nc() {
+        # Keep the fifo open for writing on our own end (fd 9) too, so
+        # nc's read side never sees EOF just because we're between
+        # writes - only wait_for_qga_ready's own cleanup closes it.
+        run_as "${_owner}" nc -U "${QGA_SOCKET}" <"${_fifo}" >>"${_out}" 2>/dev/null &
+        _nc_pid=$!
+    }
+    _start_nc
+    # NOTE: this whole function runs under the caller's `set -eu` (it's
+    # sourced into their shell, not a subprocess) - a bare failing
+    # statement here (not an if/while condition) would abort the entire
+    # calling script, not just this wait. The exec/printf calls below are
+    # therefore explicitly guarded with `|| true` even though failure is
+    # expected to be rare, so a transient hiccup degrades to "this
+    # attempt didn't get through" rather than crashing vm-init/vm-start
+    # outright.
+    exec 9>"${_fifo}" || true
+
+    _elapsed=0
+    _ready=1
+    while [ "${_elapsed}" -lt "${_timeout}" ] ; do
+        printf '%s\n' '{"execute":"guest-ping"}' >&9 2>/dev/null || true
+        sleep "${_interval}"
+        _elapsed=$((_elapsed + _interval))
+        if jq -e 'select(.return != null)' <"${_out}" >/dev/null 2>&1 ; then
+            _ready=0
+            break
+        fi
+        printf '.' >&2
+        # A transient hiccup (e.g. the connection got torn down for some
+        # reason outside our control) shouldn't wedge the rest of the
+        # wait - reconnect and keep going rather than give up early.
+        # NOTE: liveness is checked with `ps -p`, not `kill -0` - in
+        # bridged mode nc runs under sudo (root-owned), and `kill -0`
+        # from a plain user gets EPERM (not "process is gone") against a
+        # root-owned pid, which would misread "alive but not mine to
+        # signal" as dead and spawn a duplicate nc every single
+        # iteration. `ps -p` just checks the process table, no
+        # permission barrier either way - same reasoning as vm_is_running
+        # and wait_for_pid_exit elsewhere in this file.
+        if ! ps -p "${_nc_pid}" >/dev/null 2>&1 ; then
+            exec 9>&- || true
+            _start_nc
+            exec 9>"${_fifo}" || true
+        fi
+    done
+    [ "${_elapsed}" -eq 0 ] || printf '\n' >&2
+
+    exec 9>&- || true
+    # Likewise: this may be sudo's monitor pid rather than nc's own (see
+    # the module comment at the top of this file), which is root-owned
+    # in bridged mode - route through run_as rather than assuming a
+    # plain `kill` can signal it.
+    run_as "${_owner}" kill "${_nc_pid}" 2>/dev/null || true
+    rm -f "${_fifo}" "${_out}"
+    return "${_ready}"
 }
 
 # Waits (up to $2 seconds) for pid $1 to actually disappear. Returns
