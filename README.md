@@ -454,3 +454,42 @@ carefully kept structurally parallel to the now-verified `user` mode (same
 hand, but an actual `bin/vm-fulltest example.vmc` run — with a real sudo
 password typed in when prompted — is still owed before treating it as
 confirmed working.
+
+## Known open issue: intermittent bake-shutdown timeout
+
+After the `wait_for_qga_ready` fix above, two consecutive automated
+`bin/vm-fulltest example-nosudo.vmc` runs (back-to-back: tear down, rebuild,
+tear down, rebuild) both hit a *different* failure: `vm-init`'s bake boot
+requests a graceful ACPI shutdown once cloud-init finishes provisioning,
+and that shutdown didn't complete within the 120s `VM_BAKE_SHUTDOWN_TIMEOUT`
+either time — `vm-init` force-killed the bake process, and the golden-image
+assertions (flattened disk, no `cidata.iso`) failed as a direct consequence
+(the flatten step is never reached). Notably, a *later* `vm-halt` in the
+same test run — same guest OS, but already-settled rather than
+freshly-provisioned — powered off fine within 120s both times. So whatever
+is slow seems specific to the very first shutdown right after cloud-init's
+final stage, not shutdown in general.
+
+This is a **different bug from the one described above** — `wait_for_pid_exit`
+(what the bake-shutdown wait actually uses) just polls `ps -p` on the qemu
+process; it never touches the QMP or QGA sockets, so the persistent-connection
+fix doesn't apply here at all.
+
+However: a manual, non-automated `bin/vm-init example-nosudo.vmc` +
+`bin/vm-start vm-nosudo` run (by this project's owner, right after the two
+automated failures) completed cleanly — the resulting bundle's
+`virtual-hard-disk` has no backing file and no leftover `cidata.iso`/`images/`,
+confirming the bake *can* complete correctly. So this looks more like a
+timing- or load-sensitive race than a deterministic bug — possibly specific
+to running the teardown-and-rebuild cycle back-to-back with no gap, though
+that's an untested guess, not a finding.
+
+**Not yet root-caused.** If you hit this again, `run/<name>/serial.log`
+should be the first thing to check — specifically what the guest's console
+is doing in the gap between "Requesting shutdown so the disk can be
+finalized..." and either completion or the `Guest didn't power off within
+Ns` failure. That log gets overwritten by the *next* boot, so to actually
+catch it, run `bin/vm-init` on its own (not via `vm-fulltest`, which
+immediately runs `vm-start` afterward and clears it) and inspect
+`build/run/<name>/serial.log` right after a failure, before doing anything
+else with that VM.
