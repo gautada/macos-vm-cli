@@ -20,7 +20,6 @@ printf ' - Requesting ACPI shutdown for VM "%s" (pid %s)\n' "${VM_NAME}" "${VM_P
 qmp_run '{"execute":"system_powerdown"}' >/dev/null
 
 HALT_TIMEOUT="${VM_HALT_TIMEOUT:-120}"
-printf ' - Waiting up to %ss for the guest to power off...\n' "${HALT_TIMEOUT}"
 wait_for_exit_and_detach "${HALT_TIMEOUT}"
 
 printf 'VM "%s" halted and bundle detached.\n' "${VM_NAME}"

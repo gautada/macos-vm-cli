@@ -179,10 +179,29 @@ qga_ping() {
     printf '%s\n' "${_reply}" | jq -e 'select(.return != null)' >/dev/null 2>&1
 }
 
+# Prints a clear "starting to wait" line: what we're waiting for, the
+# wall-clock time right now, and the configured timeout - so there's
+# never any ambiguity about how much real time is allowed, independent of
+# whatever progress indicator the wait loop itself prints.
+_wait_announce_start() {
+    printf ' - %s (up to %ss, started %s)\n' "$1" "$2" "$(date '+%H:%M:%S')" >&2
+}
+
+# Prints a periodic progress line showing REAL elapsed wall-clock seconds
+# (computed from a start epoch, not counted in fixed per-iteration
+# increments - a loop that occasionally takes an extra beat, e.g. to
+# reconnect, would otherwise silently under-count how much time has
+# actually passed) against the timeout, plus the current wall-clock time.
+# This replaces plain dot-per-poll counters, which are easy to misread -
+# e.g. mistaking 60 dots from a 2-second-per-iteration loop for 60
+# elapsed seconds, when it's actually 120.
+_wait_progress_note() {
+    printf '   ...%ss / %ss elapsed (%s)\n' "$1" "$2" "$(date '+%H:%M:%S')" >&2
+}
+
 # Waits up to $1 seconds (polling every $2, default 3s) for the guest
-# agent to answer a guest-ping, printing a "." per attempt like the
-# old per-attempt-reconnect loops did. Returns success (0) if it
-# answered in time, failure (1) on timeout.
+# agent to answer a guest-ping. Returns success (0) if it answered in
+# time, failure (1) on timeout.
 #
 # This intentionally holds ONE long-lived connection to QGA_SOCKET open
 # for the whole wait, instead of reconnecting fresh for every attempt
@@ -203,6 +222,8 @@ wait_for_qga_ready() {
     _timeout="$1"
     _interval="${2:-3}"
     _owner="$(path_owner "${QGA_SOCKET}")"
+    _start_epoch="$(date +%s)"
+    _wait_announce_start "Waiting for guest agent to respond" "${_timeout}"
 
     _fifo="$(mktemp -u "${TMPDIR:-/tmp}/vm-qga.XXXXXX")"
     mkfifo "${_fifo}" || fail "Could not create fifo(${_fifo})"
@@ -228,16 +249,20 @@ wait_for_qga_ready() {
     exec 9>"${_fifo}" || true
 
     _elapsed=0
+    _last_note=0
     _ready=1
     while [ "${_elapsed}" -lt "${_timeout}" ] ; do
         printf '%s\n' '{"execute":"guest-ping"}' >&9 2>/dev/null || true
         sleep "${_interval}"
-        _elapsed=$((_elapsed + _interval))
+        _elapsed=$(( $(date +%s) - _start_epoch ))
         if jq -e 'select(.return != null)' <"${_out}" >/dev/null 2>&1 ; then
             _ready=0
             break
         fi
-        printf '.' >&2
+        if [ $((_elapsed - _last_note)) -ge 15 ] ; then
+            _wait_progress_note "${_elapsed}" "${_timeout}"
+            _last_note="${_elapsed}"
+        fi
         # A transient hiccup (e.g. the connection got torn down for some
         # reason outside our control) shouldn't wedge the rest of the
         # wait - reconnect and keep going rather than give up early.
@@ -255,7 +280,6 @@ wait_for_qga_ready() {
             exec 9>"${_fifo}" || true
         fi
     done
-    [ "${_elapsed}" -eq 0 ] || printf '\n' >&2
 
     exec 9>&- || true
     # Likewise: this may be sudo's monitor pid rather than nc's own (see
@@ -264,7 +288,83 @@ wait_for_qga_ready() {
     # plain `kill` can signal it.
     run_as "${_owner}" kill "${_nc_pid}" 2>/dev/null || true
     rm -f "${_fifo}" "${_out}"
+
+    _elapsed=$(( $(date +%s) - _start_epoch ))
+    if [ "${_ready}" -eq 0 ] ; then
+        printf ' - Guest agent responded after %ss\n' "${_elapsed}" >&2
+    else
+        printf ' - Guest agent did not respond (waited %ss, timeout %ss)\n' "${_elapsed}" "${_timeout}" >&2
+    fi
     return "${_ready}"
+}
+
+# Confirms cloud-init has *actually finished* - not just that the guest
+# agent answered a ping, which only proves qemu-ga itself is up and
+# listening. cloud-init could still be doing its own final-stage work
+# after that (write_files, final_message, ...), and initiating a
+# shutdown while it's still genuinely busy is a real, separate suspect
+# for a slow/hung bake shutdown - see README's "Diagnosing a hung boot".
+#
+# Uses the guest agent's guest-exec to run `cloud-init status --wait`
+# inside the guest - a real cloud-init command purpose-built for exactly
+# this kind of synchronization, which blocks until every stage is done
+# and returns a real exit code (0 = done, 2 = degraded/recoverable
+# warnings, anything else = a real error) - then polls guest-exec-status
+# for that exit code. Only call this after wait_for_qga_ready has already
+# succeeded; guest-exec would just fail to launch otherwise.
+#
+# Uses one-shot qga_send calls (a fresh connection per request) rather
+# than wait_for_qga_ready's persistent-connection trick - that trick
+# exists because reconnecting *before* the guest has booted far enough
+# to open its end of the port can desync it; by this point the agent is
+# already confirmed up and answering, which is a different, and believed
+# safe, window. If this wait itself is ever seen to hang the way the
+# original guest-ping problem did, that assumption is the first thing to
+# revisit.
+wait_for_cloud_init_done() {
+    _timeout="$1"
+    _start_epoch="$(date +%s)"
+    _wait_announce_start "Waiting for cloud-init to report done" "${_timeout}"
+
+    _launch="$(qga_send '{"execute":"guest-exec","arguments":{"path":"/usr/bin/cloud-init","arg":["status","--wait"],"capture-output":true}}' 5 2>/dev/null)"
+    _pid="$(printf '%s\n' "${_launch}" | jq -r 'select(.return.pid != null) | .return.pid' 2>/dev/null | tail -n1)"
+    if [ -z "${_pid}" ] ; then
+        warn "Could not launch 'cloud-init status --wait' via guest-exec - skipping this check"
+        return 1
+    fi
+
+    _last_note=0
+    while true ; do
+        _elapsed=$(( $(date +%s) - _start_epoch ))
+        if [ "${_elapsed}" -ge "${_timeout}" ] ; then
+            printf ' - cloud-init still not done (waited %ss, timeout %ss)\n' "${_elapsed}" "${_timeout}" >&2
+            return 1
+        fi
+        _status="$(qga_send "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":${_pid}}}" 5 2>/dev/null)"
+        if printf '%s\n' "${_status}" | jq -e 'select(.return.exited == true)' >/dev/null 2>&1 ; then
+            _exitcode="$(printf '%s\n' "${_status}" | jq -r '.return.exitcode // empty' 2>/dev/null)"
+            _elapsed=$(( $(date +%s) - _start_epoch ))
+            case "${_exitcode}" in
+                0)
+                    printf ' - cloud-init reported done after %ss\n' "${_elapsed}" >&2
+                    return 0
+                    ;;
+                2)
+                    warn "cloud-init reported a degraded status (exit 2, recoverable warnings only) after ${_elapsed}s - continuing"
+                    return 0
+                    ;;
+                *)
+                    warn "cloud-init status --wait exited ${_exitcode} after ${_elapsed}s - see serial.log"
+                    return 1
+                    ;;
+            esac
+        fi
+        if [ $((_elapsed - _last_note)) -ge 15 ] ; then
+            _wait_progress_note "${_elapsed}" "${_timeout}"
+            _last_note="${_elapsed}"
+        fi
+        sleep 3
+    done
 }
 
 # Waits (up to $2 seconds) for pid $1 to actually disappear. Returns
@@ -274,17 +374,23 @@ wait_for_qga_ready() {
 wait_for_pid_exit() {
     _pid="$1"
     _timeout="$2"
-    _elapsed=0
+    _start_epoch="$(date +%s)"
+    _wait_announce_start "Waiting for pid ${_pid} to exit" "${_timeout}"
+    _last_note=0
     while ps -p "${_pid}" >/dev/null 2>&1 ; do
+        _elapsed=$(( $(date +%s) - _start_epoch ))
         if [ "${_elapsed}" -ge "${_timeout}" ] ; then
-            [ "${_elapsed}" -eq 0 ] || printf '\n' >&2
+            printf ' - Still running (waited %ss, timeout %ss)\n' "${_elapsed}" "${_timeout}" >&2
             return 1
         fi
+        if [ $((_elapsed - _last_note)) -ge 15 ] ; then
+            _wait_progress_note "${_elapsed}" "${_timeout}"
+            _last_note="${_elapsed}"
+        fi
         sleep 2
-        _elapsed=$((_elapsed + 2))
-        printf '.' >&2
     done
-    [ "${_elapsed}" -eq 0 ] || printf '\n' >&2
+    _elapsed=$(( $(date +%s) - _start_epoch ))
+    printf ' - Exited after %ss\n' "${_elapsed}" >&2
     return 0
 }
 

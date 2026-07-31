@@ -203,7 +203,9 @@ printf ' - qemu started(pid %s)\n' "${VM_PID}"
 
 # --------------------------------------------------------------- WAIT-READY
 WAIT_TIMEOUT="${VM_START_TIMEOUT:-180}"
-printf ' - Waiting for guest agent to respond (up to %ss; Ctrl-C stops waiting, VM keeps running)\n' "${WAIT_TIMEOUT}"
+# Ctrl-C here just stops waiting - the VM keeps running in the
+# background either way (see wait_for_qga_ready in bin/vm-lib for the
+# actual progress/timeout messages this prints).
 if wait_for_qga_ready "${WAIT_TIMEOUT}" 3 ; then
     READY=1
 else

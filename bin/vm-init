@@ -497,14 +497,32 @@ sleep 2
 ps -p "${BAKE_PID}" >/dev/null 2>&1 ||
     fail "qemu exited immediately during bake boot - see ${RUN_DIR}/qemu.log and ${SERIAL_LOG}"
 
+# This confirms the guest *agent* is up - not that cloud-init has
+# actually finished (see wait_for_cloud_init_done below, which checks
+# that separately). Generous default: on bridged/full-fidelity configs
+# this is the phase covering package_update/package_upgrade, which can
+# genuinely take several minutes.
 BAKE_TIMEOUT="${VM_BAKE_TIMEOUT:-900}"
-printf ' - Waiting for guest agent to respond (up to %ss)\n' "${BAKE_TIMEOUT}"
 wait_for_qga_ready "${BAKE_TIMEOUT}" 5 ||
     fail "Guest agent didn't respond within ${BAKE_TIMEOUT}s during bake boot - see ${RUN_DIR}/qemu.log and ${SERIAL_LOG}"
-printf ' - Guest is up and cloud-init has provisioned the disk.\n'
+
+# Now confirm cloud-init itself is actually done, not just that the
+# agent answered a ping - see the comment on wait_for_cloud_init_done in
+# bin/vm-lib. Expected to resolve quickly in practice (cloud-init's
+# runcmd module, which is what starts the guest agent, runs late in its
+# own sequence - by the time the agent answers, cloud-init should have
+# little left to do), so this timeout is intentionally much smaller than
+# BAKE_TIMEOUT; it's a confirmation, not expected to be the long pole.
+BAKE_CLOUDINIT_TIMEOUT="${VM_BAKE_CLOUDINIT_TIMEOUT:-120}"
+wait_for_cloud_init_done "${BAKE_CLOUDINIT_TIMEOUT}" ||
+    fail "cloud-init did not report done within ${BAKE_CLOUDINIT_TIMEOUT}s during bake boot - see ${RUN_DIR}/qemu.log and ${SERIAL_LOG}"
 
 printf ' - Requesting shutdown so the disk can be finalized...\n'
 qmp_send '{"execute":"system_powerdown"}' >/dev/null
+# Same operation vm-halt performs on a running VM (ACPI system_powerdown,
+# then wait for qemu to exit) - see "make sure all the code timeouts are
+# compatible" in README.md's timeout table for why this shares vm-halt's
+# default rather than having its own.
 BAKE_SHUTDOWN_TIMEOUT="${VM_BAKE_SHUTDOWN_TIMEOUT:-120}"
 wait_for_pid_exit "${BAKE_PID}" "${BAKE_SHUTDOWN_TIMEOUT}" ||
     fail "Guest didn't power off within ${BAKE_SHUTDOWN_TIMEOUT}s during bake boot"

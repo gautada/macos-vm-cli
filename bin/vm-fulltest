@@ -163,7 +163,6 @@ vm_is_running || fail "VM unexpectedly not running before vm-restart"
 PID_BEFORE_RESTART="${VM_PID}"
 require "vm-restart exits 0" "${BIN_DIR}/vm-restart" "${BUNDLE_BASENAME}"
 
-printf ' - Waiting for guest agent to come back up after reset...\n'
 RESTART_TIMEOUT="${VM_FULLTEST_RESTART_TIMEOUT:-240}"
 if wait_for_qga_ready "${RESTART_TIMEOUT}" 3 ; then
     ok "guest agent responded again after reset (within ${RESTART_TIMEOUT}s)"
