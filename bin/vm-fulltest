@@ -1,38 +1,33 @@
 #!/bin/sh
 #
 # vm-fulltest [config file] - end-to-end smoke test for the whole
-# vm-<verb> toolkit. Destroys any existing VM with the same name as the
-# config file's NAME (stops it, detaches its mount, deletes its bundle),
-# builds a fresh one with vm-init, starts it, and exercises every
-# control script against it, asserting the expected result at each step.
+# vm-<verb> toolkit. Builds a fresh VM with vm-init (destroying any
+# existing bundle/mount of the same name first), starts it, and exercises
+# every control script against it, asserting the expected result at each
+# step.
 #
-# Defaults to ../example.vmc, which builds a VM named "vm" - only run
-# this against a disposable test VM, never one you care about keeping.
+# Defaults to ../example.vmc, which creates example.vmsb (reachable as
+# "example") in the *current directory* - same as a plain `vm-init` call
+# - so run this from wherever you want the throwaway bundle to land, and
+# only against a disposable test VM, never one you care about keeping.
 #
 # Exits 0 only if every assertion passed.
 
 set -eu
 BIN_DIR="$(cd "$(dirname "${0}")" && pwd)"
 REPO_DIR="$(cd "${BIN_DIR}/.." && pwd)"
-# vm-lib expects LIB_DIR (the convention every other vm-<verb> script
-# uses) to already be set before it's sourced, so it can find its own
-# REPO_DIR/build directory - this script names the same thing BIN_DIR,
-# so alias it rather than renaming everything else below.
 LIB_DIR="${BIN_DIR}"
 . "${BIN_DIR}/vm-lib"
 
 CONFIG_FILE="${1:-${REPO_DIR}/example.vmc}"
 [ -f "${CONFIG_FILE}" ] ||
     fail "Config file not found: ${CONFIG_FILE}"
-TEST_VM_NAME="$(awk -F= '$1 == "NAME" {print $2}' "${CONFIG_FILE}")"
-[ -n "${TEST_VM_NAME}" ] ||
-    fail "Could not determine NAME from ${CONFIG_FILE}"
-# Sniffed the same way, and defaulted the same way as bin/vm-init itself
-# defaults a config file without this field - used only as a fallback
-# hint for resolve_vm below, in case this VM has never been built before
-# (so there's genuinely nothing to find in either location yet).
-TEST_VM_NETMODE="$(awk -F= '$1 == "NETMODE" {print $2}' "${CONFIG_FILE}")"
-TEST_VM_NETMODE="${TEST_VM_NETMODE:-bridged}"
+# Same derivation bin/vm-init itself uses: the bundle (and therefore the
+# name every control script addresses it by) comes from the config
+# file's own basename, not its internal NAME= field.
+BUNDLE_BASENAME="$(basename "${CONFIG_FILE}")"
+BUNDLE_BASENAME="${BUNDLE_BASENAME%.vmc}"
+BUNDLE_PATH="$(pwd)/${BUNDLE_BASENAME}.vmsb"
 
 PASS=0
 FAIL=0
@@ -70,14 +65,14 @@ qmp_query_status() {
         jq -r 'select(.return != null) | .return.status' 2>/dev/null | tail -n1
 }
 
-resolve_vm "${TEST_VM_NAME}" "${TEST_VM_NETMODE}"
+resolve_vm "${BUNDLE_BASENAME}"
 
 # --------------------------------------------------------------- CLEANUP
-step "Cleaning up any existing VM named \"${TEST_VM_NAME}\""
+step "Cleaning up any existing VM named \"${BUNDLE_BASENAME}\""
 
 if vm_is_running ; then
     printf ' - Found a running VM (pid %s) - stopping it.\n' "${VM_PID}"
-    "${BIN_DIR}/vm-stop" "${TEST_VM_NAME}" || true
+    "${BIN_DIR}/vm-stop" "${BUNDLE_BASENAME}" || true
 fi
 
 if [ -e "${VM_DIR}" ] ; then
@@ -85,20 +80,14 @@ if [ -e "${VM_DIR}" ] ; then
     hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || sudo hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
 fi
 
-# Removal only needs sudo in bridged mode (root-owned bundle/run dir,
-# since qemu itself ran as root) - a user-mode VM's files are all
-# plain-user-owned already, so `rm -rf` alone succeeds and sudo is never
-# invoked. Try plain first, escalate only if that actually fails, same
-# pattern as the hdiutil detach right above - this is what keeps a
-# NETMODE=user run of this whole script from ever prompting for sudo.
+# The bundle file itself is always plain-user-owned regardless of
+# NETMODE (only the qemu process/sockets it contains while running can
+# be root-owned, in bridged mode) - removing it never needs sudo. Its
+# run-state (pidfile, sockets, logs) lives inside it, so there's nothing
+# separate left to clean up once the bundle itself is gone.
 if [ -e "${BUNDLE_PATH}" ] ; then
     printf ' - Removing existing bundle(%s)\n' "${BUNDLE_PATH}"
-    rm -rf "${BUNDLE_PATH}" 2>/dev/null || sudo rm -rf "${BUNDLE_PATH}"
-fi
-
-if [ -e "${RUN_DIR}" ] ; then
-    printf ' - Removing leftover run directory(%s)\n' "${RUN_DIR}"
-    rm -rf "${RUN_DIR}" 2>/dev/null || sudo rm -rf "${RUN_DIR}"
+    rm -rf "${BUNDLE_PATH}"
 fi
 
 # ------------------------------------------------------------------ INIT
@@ -124,17 +113,17 @@ hdiutil detach "${VM_DIR}" >/dev/null 2>&1 || true
 # an ordinary boot of an already-configured OS - no provisioning, no
 # package installs. Give it a moderate budget rather than assuming a
 # specific speedup, since that's part of what this test is meant to show.
-step "vm-start ${TEST_VM_NAME}"
+step "vm-start ${BUNDLE_PATH}"
 VM_START_TIMEOUT="${VM_FULLTEST_BOOT_TIMEOUT:-240}"
 export VM_START_TIMEOUT
 require "vm-start exits 0 (guest responded within ${VM_START_TIMEOUT}s)" \
-    "${BIN_DIR}/vm-start" "${TEST_VM_NAME}"
+    "${BIN_DIR}/vm-start" "${BUNDLE_PATH}"
 require "bundle is mounted while VM runs" [ -e "${VM_DIR}" ]
 require "VM shows running" vm_is_running
 
 # --------------------------------------------------------------- STATUS
-step "vm-status ${TEST_VM_NAME}"
-STATUS_OUT="$("${BIN_DIR}/vm-status" "${TEST_VM_NAME}" 2>&1)" || true
+step "vm-status ${BUNDLE_BASENAME}"
+STATUS_OUT="$("${BIN_DIR}/vm-status" "${BUNDLE_BASENAME}" 2>&1)" || true
 printf '%s\n' "${STATUS_OUT}"
 if printf '%s\n' "${STATUS_OUT}" | grep -qi "running" ; then
     ok "vm-status reports running"
@@ -143,15 +132,15 @@ else
 fi
 
 # ---------------------------------------------------------------- PAUSE
-step "vm-pause ${TEST_VM_NAME}"
-require "vm-pause exits 0" "${BIN_DIR}/vm-pause" "${TEST_VM_NAME}"
+step "vm-pause ${BUNDLE_BASENAME}"
+require "vm-pause exits 0" "${BIN_DIR}/vm-pause" "${BUNDLE_BASENAME}"
 STATE="$(qmp_query_status)"
 if [ "${STATE}" = "paused" ] ; then
     ok "guest state is paused (QMP query-status)"
 else
     bad "expected guest state 'paused', got '${STATE}'"
 fi
-STATUS_OUT="$("${BIN_DIR}/vm-status" "${TEST_VM_NAME}" 2>&1)" || true
+STATUS_OUT="$("${BIN_DIR}/vm-status" "${BUNDLE_BASENAME}" 2>&1)" || true
 if printf '%s\n' "${STATUS_OUT}" | grep -qi "paused" ; then
     ok "vm-status reports paused"
 else
@@ -159,8 +148,8 @@ else
 fi
 
 # --------------------------------------------------------------- RESUME
-step "vm-resume ${TEST_VM_NAME}"
-require "vm-resume exits 0" "${BIN_DIR}/vm-resume" "${TEST_VM_NAME}"
+step "vm-resume ${BUNDLE_BASENAME}"
+require "vm-resume exits 0" "${BIN_DIR}/vm-resume" "${BUNDLE_BASENAME}"
 STATE="$(qmp_query_status)"
 if [ "${STATE}" = "running" ] ; then
     ok "guest state is running again (QMP query-status)"
@@ -169,10 +158,10 @@ else
 fi
 
 # -------------------------------------------------------------- RESTART
-step "vm-restart ${TEST_VM_NAME}"
+step "vm-restart ${BUNDLE_BASENAME}"
 vm_is_running || fail "VM unexpectedly not running before vm-restart"
 PID_BEFORE_RESTART="${VM_PID}"
-require "vm-restart exits 0" "${BIN_DIR}/vm-restart" "${TEST_VM_NAME}"
+require "vm-restart exits 0" "${BIN_DIR}/vm-restart" "${BUNDLE_BASENAME}"
 
 printf ' - Waiting for guest agent to come back up after reset...\n'
 RESTART_TIMEOUT="${VM_FULLTEST_RESTART_TIMEOUT:-240}"
@@ -189,11 +178,11 @@ else
 fi
 
 # ----------------------------------------------------------------- HALT
-step "vm-halt ${TEST_VM_NAME}"
+step "vm-halt ${BUNDLE_BASENAME}"
 VM_HALT_TIMEOUT="${VM_FULLTEST_HALT_TIMEOUT:-120}"
 export VM_HALT_TIMEOUT
 require "vm-halt exits 0 (guest powered off within ${VM_HALT_TIMEOUT}s)" \
-    "${BIN_DIR}/vm-halt" "${TEST_VM_NAME}"
+    "${BIN_DIR}/vm-halt" "${BUNDLE_BASENAME}"
 if vm_is_running ; then
     bad "VM still shows running after vm-halt"
 else
@@ -202,18 +191,18 @@ fi
 require "bundle detached after vm-halt" [ ! -e "${VM_DIR}" ]
 
 # ----------------------------------------------------------- START (2nd)
-step "vm-start ${TEST_VM_NAME} (second boot)"
+step "vm-start ${BUNDLE_PATH} (second boot)"
 VM_START_TIMEOUT="${VM_FULLTEST_BOOT_TIMEOUT:-240}"
 export VM_START_TIMEOUT
 require "vm-start exits 0 (guest responded within ${VM_START_TIMEOUT}s)" \
-    "${BIN_DIR}/vm-start" "${TEST_VM_NAME}"
+    "${BIN_DIR}/vm-start" "${BUNDLE_PATH}"
 
 # ----------------------------------------------------------------- STOP
-step "vm-stop ${TEST_VM_NAME}"
+step "vm-stop ${BUNDLE_BASENAME}"
 VM_STOP_TIMEOUT="${VM_FULLTEST_STOP_TIMEOUT:-30}"
 export VM_STOP_TIMEOUT
 require "vm-stop exits 0 (qemu exited within ${VM_STOP_TIMEOUT}s)" \
-    "${BIN_DIR}/vm-stop" "${TEST_VM_NAME}"
+    "${BIN_DIR}/vm-stop" "${BUNDLE_BASENAME}"
 if vm_is_running ; then
     bad "VM still shows running after vm-stop"
 else

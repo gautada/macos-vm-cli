@@ -1,13 +1,15 @@
 #!/bin/sh
 #
-# vm-init - build a new VM as a self-contained, mountable sparsebundle,
-# and bake a "golden" disk image for it.
+# vm-init - build a new VM as a self-contained, mountable sparsebundle
+# (.vmsb), and bake a "golden" disk image for it.
 #
-# Everything the VM needs to run (the golden virtual disk, UEFI
-# firmware/vars) is written onto the volume of a sparsebundle disk image
-# at /Users/Shared/qemu/vms/<name>.sparsebundle. The bundle is mounted at
-# /Volumes/<name> only for the duration of this build, then detached.
-# bin/vm-start re-mounts it to actually run the VM.
+# The bundle is created wherever you run this from (the current working
+# directory), named after the given config file: `vm-init example.vmc`
+# from ~/Workspace/VM creates ~/Workspace/VM/example.vmsb - there's no
+# other fixed location involved. It's mounted at /Volumes/<basename>
+# (e.g. /Volumes/example) only for the duration of this build, then
+# detached. bin/vm-start takes a path to the .vmsb file to re-mount it
+# and actually run the VM.
 #
 # "Baking" means: this script boots the freshly-built disk once, with a
 # cloud-init seed ISO attached, and lets cloud-init do its one-time
@@ -112,13 +114,15 @@ load_vm_variable "DISK"
 load_vm_variable "MAC"
 load_vm_variable "OS"
 
-# NETMODE picks the VM's networking backend and (via resolve_vm's
-# location check, for the vm-<verb> scripts) where its state lives:
+# NETMODE picks the VM's networking backend - see bin/vm-lib for the
+# full rationale. It no longer affects *where* anything lives (that's
+# always just wherever you run this from - see BUNDLE_PATH below); it
+# only affects the qemu invocation itself, further down.
 #   bridged (default, for compatibility with configs from before this
 #     field existed) - vmnet-bridged onto a real host interface, needing
-#     sudo throughout; shared state at /Users/Shared/qemu.
+#     sudo throughout.
 #   user - qemu's own usermode/SLIRP networking, fully unprivileged, no
-#     sudo anywhere; state lives entirely under this repo's build/.
+#     sudo anywhere.
 load_vm_variable_default "NETMODE" "bridged"
 case "${VM_NETMODE}" in
     bridged|user) ;;
@@ -140,70 +144,56 @@ else
     unset IP GATEWAY 2>/dev/null || true
 fi
 
-# Where this VM's state lives, chosen by NETMODE - see the comment on
-# QEMU_DIR_BRIDGED/QEMU_DIR_USER in bin/vm-lib for why.
-case "${VM_NETMODE}" in
-    bridged) QEMU_DIR="${QEMU_DIR_BRIDGED}" ;;
-    user)    QEMU_DIR="${QEMU_DIR_USER}" ;;
-esac
-VMS_DIR="${QEMU_DIR}/vms"
-
 # Resolve the cloud-init templates relative to this script's own location
-# (not the caller's cwd, and not a copy under /Users/Shared/qemu). The
-# templates are part of this repo, not part of any individual VM, so they
-# should always come from wherever this script itself lives.
+# (not the caller's cwd). The templates are part of this repo, not part
+# of any individual VM, so they should always come from wherever this
+# script itself lives.
 SCRIPT_DIR="$(cd "$(dirname "${0}")/.." && pwd)"
 REPO_TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 [ -d "${REPO_TEMPLATES_DIR}" ] ||
     fail "Templates directory not found: ${REPO_TEMPLATES_DIR}"
 
-# QEMU_DIR holds two things, regardless of mode:
-#   vms/    - one <name>.sparsebundle package per VM (the actual VMs)
-#   cache/  - downloaded base OS images, shared across VMs of the same OS
-#             release so re-running vm-init doesn't re-download each time
-#
-# In bridged mode this is /Users/Shared/qemu - shared, host-wide state
-# not owned by this repo checkout, so it's created/chowned with sudo the
-# first time and reused by every VM. In user mode it's this repo's own
-# build/ directory - already owned by the plain user, so no sudo is
-# needed (or used) to set it up.
-if [ "${VM_NETMODE}" = "bridged" ] ; then
-    sudo mkdir -p "${QEMU_DIR}"
-    sudo chown -R "${USER}":staff "${QEMU_DIR}"
-else
-    mkdir -p "${QEMU_DIR}"
-fi
-# VM bundle location
-mkdir -p "${VMS_DIR}"
-# Shared download cache for base OS images, so re-running vm-init for
-# multiple VMs of the same OS release doesn't re-download it each time.
-# Each VM bundle still gets its own copy (below), so the bundle itself
-# stays fully self-contained and portable.
-CACHE_DIR="${QEMU_DIR}/cache/images"
-mkdir -p "${CACHE_DIR}"
-printf ' - QEMU folder(%s)\n' "${QEMU_DIR}"
-printf ' - - VM bundles folder(%s)\n' "${VMS_DIR}"
-printf ' - - Image cache folder(%s)\n' "${CACHE_DIR}"
+# The bundle is created wherever you run this from, named after the
+# config file (not the config's own NAME= field, which is a separate,
+# guest-internal identity - see templates/meta-data/user-data). A
+# "some/path/example.vmc" argument still just produces "example.vmsb" in
+# the current directory - only the basename is used, and only the
+# trailing .vmc is stripped (a config file named without that extension
+# works fine too, it just keeps whatever name it already had).
+BUNDLE_BASENAME="$(basename "${CONFIG_FILE}")"
+BUNDLE_BASENAME="${BUNDLE_BASENAME%.vmc}"
+BUNDLE_PATH="$(pwd)/${BUNDLE_BASENAME}.vmsb"
+printf ' - Bundle will be created at(%s)\n' "${BUNDLE_PATH}"
 
 # Fail rather than silently reuse or overwrite an existing VM of the same
-# name - both the packaged bundle and the mount point are checked, since
+# name - both the bundle file and the mount point are checked, since
 # either one existing means a naming collision that needs the operator's
-# attention (e.g. a leftover mount from a crashed run).
-BUNDLE_PATH="${VMS_DIR}/${VM_NAME}.sparsebundle"
+# attention (e.g. a leftover mount from a crashed run, or simply already
+# having a VM by this name here).
 [ -e "${BUNDLE_PATH}" ] &&
-    fail "Existing Virtual Machine bundle(${VM_NAME}) at '${BUNDLE_PATH}'"
-VM_DIR="/Volumes/${VM_NAME}"
+    fail "Existing Virtual Machine bundle at '${BUNDLE_PATH}'"
+VM_DIR="/Volumes/${BUNDLE_BASENAME}"
 [ -e "${VM_DIR}" ] &&
     fail "Mount point already in use: '${VM_DIR}'"
 # Host-side runtime state used during the bake boot below (sockets,
-# pidfile, log) - same paths bin/vm-start uses, so its own stale-state
-# cleanup naturally takes care of anything left behind here.
-RUN_DIR="${QEMU_DIR}/run/${VM_NAME}"
+# pidfile, log) - inside the mounted volume itself (see bin/vm-lib's
+# resolve_vm), so bin/vm-start and the vm-<verb> control scripts find it
+# the same way later, with no separate location to keep track of.
+RUN_DIR="${VM_DIR}/.run"
 PID_FILE="${RUN_DIR}/pid"
 QMP_SOCKET="${RUN_DIR}/qmp.sock"
 QGA_SOCKET="${RUN_DIR}/qemu-ga.sock"
 SERIAL_SOCKET="${RUN_DIR}/serial.sock"
 SERIAL_LOG="${RUN_DIR}/serial.log"
+
+# Shared, unprivileged download cache for base OS images (see bin/vm-lib)
+# - reused across every VM built on this OS release regardless of
+# NETMODE or where each one's .vmsb ends up, so re-running vm-init
+# doesn't re-download the same image every time. Each VM bundle still
+# gets its own copy (below), so the bundle itself stays fully
+# self-contained and portable.
+mkdir -p "${IMAGE_CACHE_DIR}"
+printf ' - - Image cache folder(%s)\n' "${IMAGE_CACHE_DIR}"
 printf '\n\n\n'
 
 # ------------------------------------------------------------------ BUNDLE
@@ -220,9 +210,19 @@ BUNDLE_SIZE="$((BUNDLE_GB + BUNDLE_OVERHEAD_GB))g"
 printf ' - Creating sparsebundle(%s) size(%s)\n' "${BUNDLE_PATH}" "${BUNDLE_SIZE}"
 # APFS: modern, sparse-file-friendly, handles the large qcow2/base-image
 # files well. -volname controls the label shown when mounted, which is
-# also what determines the /Volumes/<name> mount point below.
-hdiutil create -type SPARSEBUNDLE -fs APFS -volname "${VM_NAME}" \
+# also what determines the /Volumes/<name> mount point below - note this
+# is BUNDLE_BASENAME (the file's own name), not VM_NAME (the config's
+# NAME= field, which only affects the guest's own hostname/FQDN).
+# hdiutil unconditionally appends its own ".sparsebundle" suffix to
+# whatever path you give it that doesn't already end in exactly that
+# (observed: asking for "example.vmsb" actually produces
+# "example.vmsb.sparsebundle") - there's no flag to suppress this, so
+# create it, then rename the result to the exact .vmsb path we actually
+# want. A sparsebundle is just a package directory; renaming it doesn't
+# affect its validity as a disk image at all.
+hdiutil create -type SPARSEBUNDLE -fs APFS -volname "${BUNDLE_BASENAME}" \
   -size "${BUNDLE_SIZE}" "${BUNDLE_PATH}"
+mv "${BUNDLE_PATH}.sparsebundle" "${BUNDLE_PATH}"
 
 printf ' - Attaching bundle at(%s)\n' "${VM_DIR}"
 hdiutil attach "${BUNDLE_PATH}" -mountpoint "${VM_DIR}"
@@ -262,7 +262,7 @@ IMAGE_SOURCE="ubuntu-${VM_OS}-server-cloudimg-arm64.img"
 
 # Download into the shared cache (not the bundle) first, so building
 # several VMs on the same OS release only pays the download cost once.
-CACHED_IMAGE_FILE="${CACHE_DIR}/ubuntu-${VM_OS}.img"
+CACHED_IMAGE_FILE="${IMAGE_CACHE_DIR}/ubuntu-${VM_OS}.img"
 printf ' - Base Image(%s) Refresh\n' "${CACHED_IMAGE_FILE}"
 if [ ! -f "${CACHED_IMAGE_FILE}" ] ; then
 curl --fail --location --output "${CACHED_IMAGE_FILE}" --progress-bar \
@@ -272,7 +272,7 @@ fi
 # it as a VM's disk backing file - a corrupted or tampered image would
 # otherwise fail silently or much later, deep inside the guest.
 IMAGE_CSUM="SHA256SUMS"
-IMAGE_SHA256SUM="${CACHE_DIR}/${IMAGE_CSUM}"
+IMAGE_SHA256SUM="${IMAGE_CACHE_DIR}/${IMAGE_CSUM}"
 curl --fail --location --output "${IMAGE_SHA256SUM}" --progress-bar \
   "${IMAGE_URL}/${IMAGE_CSUM}"
 EXPECTED="$(awk -v src="${IMAGE_SOURCE}" '$2 == "*" src || $2 == src {print $1}' "${IMAGE_SHA256SUM}")"
@@ -536,5 +536,6 @@ printf '\n\n\n'
 # trap above, which detaches it - no separate detach needed here.
 
 printf '\n'
-printf 'VM "%s" built at: %s\n' "${VM_NAME}" "${BUNDLE_PATH}"
-printf 'Run "bin/vm-start %s" to mount and start it.\n' "${VM_NAME}"
+printf 'VM built at: %s\n' "${BUNDLE_PATH}"
+printf 'Run "bin/vm-start %s" to mount and start it - it will be reachable\n' "${BUNDLE_PATH}"
+printf 'as "%s" (e.g. "bin/vm-status %s") once running.\n' "${BUNDLE_BASENAME}" "${BUNDLE_BASENAME}"

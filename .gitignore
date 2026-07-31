@@ -1,4 +1,9 @@
-# NETMODE=user VMs live entirely under here (sparsebundles, run-time
-# sockets/pidfiles/logs, cached base images) - this is host-local state,
-# not part of the toolkit itself. See README.md and bin/vm-lib.
+# VM bundles - created wherever you run bin/vm-init from (see
+# bin/vm-init and README.md), including this repo's own root when
+# testing. Host-local, disposable state - never part of the toolkit
+# itself.
+*.vmsb
+
+# Older layout: NETMODE=user VMs used to live under a fixed build/
+# directory here. No longer created, but ignored in case one lingers.
 /build/

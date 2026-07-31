@@ -1,8 +1,15 @@
 #!/bin/sh
 #
-# vm-start - mount a VM's sparsebundle and start it headlessly under
-# qemu, waiting until the guest agent responds before returning control
-# to the shell prompt.
+# vm-start <path to .vmsb> - mount a VM's sparsebundle and start it
+# headlessly under qemu, waiting until the guest agent responds before
+# returning control to the shell prompt.
+#
+# Unlike the vm-<verb> control scripts (which take a bare VM name, since
+# they only ever talk to an already-running/mounted VM), this takes the
+# actual path to the .vmsb file, since that's the only way to find one
+# that isn't running yet - there's no fixed, well-known location bin/vm-
+# init put it in to search. Once mounted, it's reachable by name (the
+# .vmsb's own basename) at /Volumes/<name>, same as everything else.
 #
 # This boots the "golden" virtual-hard-disk that bin/vm-init already
 # baked cloud-init's provisioning into - there's no cloud-init seed drive
@@ -27,7 +34,18 @@ set -eu
 LIB_DIR="$(cd "$(dirname "${0}")" && pwd)"
 . "${LIB_DIR}/vm-lib"
 
-resolve_vm "${1:-}"
+VMSB_ARG="${1:-}"
+[ -n "${VMSB_ARG}" ] ||
+    fail "Usage: ${0} <path to .vmsb>"
+[ -e "${VMSB_ARG}" ] ||
+    fail "File not found: ${VMSB_ARG}"
+# Resolve to an absolute path up front, so every message/hdiutil call
+# below is unambiguous regardless of the caller's cwd.
+BUNDLE_PATH="$(cd "$(dirname "${VMSB_ARG}")" && pwd)/$(basename "${VMSB_ARG}")"
+BUNDLE_BASENAME="$(basename "${BUNDLE_PATH}")"
+BUNDLE_BASENAME="${BUNDLE_BASENAME%.vmsb}"
+
+resolve_vm "${BUNDLE_BASENAME}"
 
 # A stale pidfile from a crashed run is fine to clean up, but refuse to
 # start a second copy of the same VM if that pid is still alive.
@@ -44,34 +62,16 @@ if [ -e "${VM_DIR}" ] ; then
         fail "Could not detach stale mount at ${VM_DIR} - resolve this manually before starting."
 fi
 
-mkdir -p "${RUN_DIR}"
-# Remove stale sockets/pidfile/log left behind by an earlier QEMU process.
-rm -f "${SERIAL_SOCKET}" "${QGA_SOCKET}" "${QMP_SOCKET}" "${PID_FILE}" "${RUN_DIR}/qemu.log" "${SERIAL_LOG}"
-# Pre-create the serial log as the plain user, and before qemu (running
-# as root via sudo) ever opens it - writing to an already-existing file
-# doesn't change its permissions, so this keeps it readable without sudo
-# for debugging.
-: > "${SERIAL_LOG}"
-chmod 644 "${SERIAL_LOG}"
-
 printf ' - Attaching bundle(%s) at(%s)\n' "${BUNDLE_PATH}" "${VM_DIR}"
 hdiutil attach "${BUNDLE_PATH}" -mountpoint "${VM_DIR}"
-
-ENV_FILE="${VM_DIR}/config"
-[ -f "$ENV_FILE" ] ||
-    fail "Missing config file(${ENV_FILE})"
-
-set -a
-. "${ENV_FILE}"
-set +a
-
-QEMU="/opt/homebrew/bin/qemu-system-aarch64"
 
 # Tracks whether qemu has successfully launched and stayed up: while
 # that's false, a failure or interruption here means nothing is using the
 # volume yet, so it's safe (and correct) to detach it. Once true, the
 # volume must stay mounted for as long as the background qemu process is
-# running.
+# running. Defined and trapped immediately after attaching, so anything
+# that fails from here on (a missing config file, RUN_DIR setup, ...)
+# still cleans up the mount rather than leaving it stranded.
 DAEMON_STARTED=0
 KEEPALIVE_PID=""
 
@@ -86,9 +86,33 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# VM_NETMODE was determined by resolve_vm above from which of the two
-# known VM locations this bundle actually lives in (see bin/vm-lib) -
-# that's the source of truth here, not re-derived from the config file.
+# RUN_DIR lives *inside* the mounted volume (see bin/vm-lib's
+# resolve_vm), so this can only happen now, after attaching - not before,
+# the way a fixed, external RUN_DIR location could.
+mkdir -p "${RUN_DIR}"
+# Remove stale sockets/pidfile/log left behind by an earlier QEMU process.
+rm -f "${SERIAL_SOCKET}" "${QGA_SOCKET}" "${QMP_SOCKET}" "${PID_FILE}" "${RUN_DIR}/qemu.log" "${SERIAL_LOG}"
+# Pre-create the serial log as the plain user, and before qemu (running
+# as root via sudo) ever opens it - writing to an already-existing file
+# doesn't change its permissions, so this keeps it readable without sudo
+# for debugging.
+: > "${SERIAL_LOG}"
+chmod 644 "${SERIAL_LOG}"
+
+ENV_FILE="${VM_DIR}/config"
+[ -f "$ENV_FILE" ] ||
+    fail "Missing config file(${ENV_FILE})"
+
+set -a
+. "${ENV_FILE}"
+set +a
+# The copied config sets a bare NETMODE (or none, for configs written
+# before this field existed) - default it the same way bin/vm-init does,
+# so an old bridged-only VM built before NETMODE existed still works.
+VM_NETMODE="${NETMODE:-bridged}"
+
+QEMU="/opt/homebrew/bin/qemu-system-aarch64"
+
 # Only bridged mode's qemu (and the guest-agent polling below) needs
 # sudo at all; user mode runs entirely unprivileged. Authenticate once
 # up front and keep the ticket refreshed in the background for the rest

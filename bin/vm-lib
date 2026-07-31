@@ -1,33 +1,36 @@
 #!/bin/sh
 #
-# vm-lib - shared helpers for the vm-<verb> control scripts (vm-status,
-# vm-halt, vm-stop, vm-restart, vm-pause, vm-resume) as well as vm-init,
-# vm-start and vm-fulltest. Meant to be sourced, not executed directly.
+# vm-lib - shared helpers for vm-init, vm-start, vm-fulltest, and the
+# vm-<verb> control scripts (vm-status, vm-halt, vm-stop, vm-restart,
+# vm-pause, vm-resume). Meant to be sourced, not executed directly.
 #
 # Every VM runs in one of two network modes, chosen per-VM by the
 # NETMODE field in its .vmc config file (see bin/vm-init):
 #
 #   bridged (default) - -netdev vmnet-bridged, needing raw host network
 #     access, so qemu itself runs under `sudo`, and everything it creates
-#     (sockets, pidfile-worthy state) ends up root-owned. Shared,
-#     host-wide state lives at /Users/Shared/qemu.
+#     (sockets, etc.) ends up root-owned.
 #   user - qemu's own usermode/SLIRP networking (-netdev user), which
 #     needs no special privilege at all - qemu runs as the plain invoking
 #     user, so nothing it creates needs sudo to read or control either.
-#     State lives entirely under this repo checkout, at ./build.
 #
-# bin/vm-init reads NETMODE directly from the config file it's given, so
-# it always knows which location/mode to use up front. The vm-<verb>
-# scripts, though, only ever receive a bare VM *name* - resolve_vm()
-# below is what figures out which of the two locations (and therefore
-# which mode) a given name actually lives in, by checking both.
+# A VM is just a .vmsb sparsebundle file, addressed by path - bin/vm-init
+# creates one wherever you run it from (named after the config file you
+# gave it), and bin/vm-start takes a path to one directly. There's no
+# fixed, well-known location a VM "lives" in on disk. Once it's running,
+# though, it's mounted at a predictable place - /Volumes/<name>, where
+# <name> is the .vmsb's own basename - and everything the vm-<verb>
+# control scripts need (pidfile, QMP/guest-agent/serial sockets, logs)
+# lives *inside* that mount, under a hidden .run/ subdirectory. That's
+# what lets those scripts, which only ever take a bare VM name rather
+# than a path, find everything with no search or lookup at all:
+# resolve_vm() below just computes /Volumes/<name>/.run/... directly.
 #
-# Socket/process ownership is then used to decide, automatically and
-# per-call, whether a given command needs `sudo` - see path_owner(),
-# pid_owner() and run_as() below. This keeps "try without sudo, only
-# escalate if the thing you're touching is actually root-owned" in one
-# place, rather than needing every caller to know and pass the mode
-# through explicitly.
+# Socket/process ownership is used to decide, automatically and per-call,
+# whether a given command needs `sudo` - see path_owner(), pid_owner()
+# and run_as() below. This keeps "try without sudo, only escalate if the
+# thing you're touching is actually root-owned" in one place, rather than
+# needing every caller to know and pass the mode through explicitly.
 
 warn() {
     printf 'WARN: %s\n' "$*" >&2
@@ -43,21 +46,13 @@ command -v jq >/dev/null 2>&1 ||
 command -v nc >/dev/null 2>&1 ||
     fail "This script requires 'nc'"
 
-# LIB_DIR is set by every caller (vm-init, vm-start, vm-status, ...)
-# immediately before sourcing this file, as
-# LIB_DIR="$(cd "$(dirname "${0}")" && pwd)" - that assignment runs in
-# this same shell (sourcing, not exec), so it's already in scope here.
-REPO_DIR="$(cd "${LIB_DIR}/.." && pwd)"
-
-# Bridged mode: today's original behavior. Shared, host-wide location,
-# root-owned because qemu itself runs under sudo for vmnet-bridged.
-QEMU_DIR_BRIDGED="/Users/Shared/qemu"
-VMS_DIR_BRIDGED="${QEMU_DIR_BRIDGED}/vms"
-
-# User mode: fully unprivileged. Lives entirely inside this repo
-# checkout so nothing outside it - and no sudo - is ever required.
-QEMU_DIR_USER="${REPO_DIR}/build"
-VMS_DIR_USER="${QEMU_DIR_USER}/vms"
+# Shared, unprivileged download cache for base OS images - keyed only by
+# OS release, so building many VMs never re-downloads the same image
+# twice no matter where each one's .vmsb ends up. An ordinary per-user
+# cache directory; no sudo is ever involved in creating or using it, in
+# either NETMODE (only the qemu process itself, and its sockets, care
+# about NETMODE).
+IMAGE_CACHE_DIR="${HOME}/.cache/vm-cli/images"
 
 # Prints the username that owns the given path (file or directory), or
 # nothing if it doesn't exist / can't be stat'd.
@@ -87,60 +82,27 @@ run_as() {
     fi
 }
 
-# Resolves a VM name into its paths, without requiring it to be running.
-# Checks both the bridged and user-mode VM locations and uses whichever
-# one actually has this VM, so the vm-<verb> scripts (which only ever
-# get a bare name, never the original .vmc) don't need to be told which
-# mode a VM was built in.
+# Resolves a VM name into its paths. A VM's mount point is always
+# predictable from its name alone (/Volumes/<name>), so this never needs
+# to search anywhere or know where its .vmsb file lives on disk - it
+# doesn't even check that the mount actually exists. Existence/liveness
+# is checked separately, by vm_is_running() below: a VM that isn't
+# currently mounted here is simply "not running" as far as these scripts
+# are concerned, whether it's never been started or its .vmsb lives
+# somewhere else entirely.
 #
-# An optional second argument is a fallback NETMODE ("bridged" or
-# "user") to assume if the bundle doesn't exist in EITHER location,
-# instead of failing outright - for callers like bin/vm-fulltest that
-# need to compute a VM's paths before it's necessarily been built yet
-# (e.g. to clean up nothing on a truly first-ever run), and who - unlike
-# the vm-<verb> scripts - do have the original .vmc config to read a
-# real NETMODE from rather than guessing. Without this second argument,
-# a VM that doesn't exist anywhere is still a hard failure, since for
-# vm-status/vm-halt/etc a bare name with no bundle really is an error.
-#
-# Sets: VM_NAME, VM_NETMODE, QEMU_DIR, VMS_DIR, BUNDLE_PATH, VM_DIR,
-# RUN_DIR, PID_FILE, QMP_SOCKET, QGA_SOCKET, SERIAL_SOCKET, SERIAL_LOG.
+# Sets: VM_NAME, VM_DIR, RUN_DIR, PID_FILE, QMP_SOCKET, QGA_SOCKET,
+# SERIAL_SOCKET, SERIAL_LOG.
 resolve_vm() {
     VM_NAME="${1:-}"
-    _fallback_mode="${2:-}"
     [ -n "${VM_NAME}" ] ||
         fail "Usage: ${0} <vm name>"
 
-    _bridged_bundle="${VMS_DIR_BRIDGED}/${VM_NAME}.sparsebundle"
-    _user_bundle="${VMS_DIR_USER}/${VM_NAME}.sparsebundle"
-
-    if [ -e "${_bridged_bundle}" ] && [ -e "${_user_bundle}" ] ; then
-        fail "VM \"${VM_NAME}\" exists in both bridged(${_bridged_bundle}) and user(${_user_bundle}) locations - remove one before continuing."
-    elif [ -e "${_bridged_bundle}" ] ; then
-        VM_NETMODE="bridged"
-        QEMU_DIR="${QEMU_DIR_BRIDGED}"
-        VMS_DIR="${VMS_DIR_BRIDGED}"
-        BUNDLE_PATH="${_bridged_bundle}"
-    elif [ -e "${_user_bundle}" ] ; then
-        VM_NETMODE="user"
-        QEMU_DIR="${QEMU_DIR_USER}"
-        VMS_DIR="${VMS_DIR_USER}"
-        BUNDLE_PATH="${_user_bundle}"
-    elif [ -n "${_fallback_mode}" ] ; then
-        case "${_fallback_mode}" in
-            bridged) QEMU_DIR="${QEMU_DIR_BRIDGED}" ;;
-            user)    QEMU_DIR="${QEMU_DIR_USER}" ;;
-            *) fail "Invalid resolve_vm fallback mode '${_fallback_mode}' (expected 'bridged' or 'user')" ;;
-        esac
-        VM_NETMODE="${_fallback_mode}"
-        VMS_DIR="${QEMU_DIR}/vms"
-        BUNDLE_PATH="${VMS_DIR}/${VM_NAME}.sparsebundle"
-    else
-        fail "No VM bundle found for \"${VM_NAME}\" (looked in ${_bridged_bundle} and ${_user_bundle}). Run bin/vm-init first."
-    fi
-
     VM_DIR="/Volumes/${VM_NAME}"
-    RUN_DIR="${QEMU_DIR}/run/${VM_NAME}"
+    # Hidden, inside the mounted volume itself - host-side runtime state
+    # (sockets, pidfile, logs) travels with the VM for as long as it's
+    # running, with no separate location to keep track of.
+    RUN_DIR="${VM_DIR}/.run"
     PID_FILE="${RUN_DIR}/pid"
     QMP_SOCKET="${RUN_DIR}/qmp.sock"
     QGA_SOCKET="${RUN_DIR}/qemu-ga.sock"
