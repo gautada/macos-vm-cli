@@ -184,9 +184,9 @@ This is a one-time build step per VM. In order, it:
    2. Waits for the guest agent to respond to a ping (confirms `qemu-ga`
       itself is up — see "Diagnosing a hung boot" below).
    3. **Separately confirms cloud-init has actually finished** — not just
-      that the agent answered — via `cloud-init status --wait`, run inside
-      the guest through the guest agent's `guest-exec` (see "Diagnosing a
-      hung boot" for why this distinction matters).
+      that the agent answered — by watching the serial console log for
+      cloud-init's own completion message (see "Diagnosing a hung boot"
+      for why this distinction matters).
    4. Requests a graceful shutdown (QMP `system_powerdown` — the software
       equivalent of pressing the physical power button; the guest's own OS
       decides how and when to actually respond) and waits for qemu to exit.
@@ -406,17 +406,26 @@ poweroff, distinct from hang #1 above (`wait_for_pid_exit`, what the
 shutdown wait actually uses, never touches the QMP or QGA sockets at all,
 so the persistent-connection fix doesn't apply to it).
 
-To close this gap, `wait_for_cloud_init_done` in `bin/vm-lib` runs
-`cloud-init status --wait` *inside the guest*, via the guest agent's
-`guest-exec` feature, and waits for cloud-init itself to report a real
-exit code (0 = done, 2 = degraded/recoverable warnings only, anything else
-= a real error) before `vm-init` ever requests a shutdown. This is expected
-to resolve quickly in practice — cloud-init's `runcmd` module, which is
-what starts the guest agent, runs late in cloud-init's own sequence, so by
-the time the agent answers there should be little left for cloud-init to
-do — which is exactly why its timeout (`VM_BAKE_CLOUDINIT_TIMEOUT`,
-default 120s) is much smaller than the guest-agent wait itself. Whether
-this fully explains the intermittent bake-shutdown slowness is **not yet
+To close this gap, `wait_for_cloud_init_done` in `bin/vm-lib` polls the
+*host-side* `serial.log` for the distinctive completion message
+`templates/user-data*`'s `final_message:` field renders (cloud-init's
+`cc_final_message` module prints this near the very end of its own last
+stage) before `vm-init` ever requests a shutdown. Deliberately host-side,
+not another round of guest-agent traffic (e.g. `guest-exec` + polling
+`guest-exec-status`, which was the first version of this check) — the
+original hang above was reconnect churn on that exact channel, so a second
+mechanism depending on it for a problem a simple file grep already solves
+would be the wrong trade. This is expected to resolve quickly in practice —
+cloud-init's `runcmd` module, which is what starts the guest agent, runs
+late in cloud-init's own sequence, so by the time the agent answers there
+should be little left for cloud-init to do — which is exactly why its
+timeout (`VM_BAKE_CLOUDINIT_TIMEOUT`, default 120s) is much smaller than
+the guest-agent wait itself. One trade-off worth knowing: unlike
+`cloud-init status --wait`'s real exit code, a log grep can't distinguish
+a clean finish from one where something failed but cloud-init still
+reached its last stage — acceptable here, since the question being
+answered is only "is it safe to request a shutdown now". Whether this
+fully explains the intermittent bake-shutdown slowness is **not yet
 confirmed** — see "Known open issue" below.
 
 **If you ever do hit a genuinely stuck boot**, `.run/serial.log` (inside
@@ -453,7 +462,7 @@ whichever wait function is watching it — see "Reading wait progress" above.
 | `VM_HALT_TIMEOUT`                | 120s    | `vm-halt`: qemu exits after a graceful ACPI shutdown request               |
 | `VM_STOP_TIMEOUT`                 | 30s     | `vm-stop`: qemu exits after a hard QMP `quit` (should be near-instant)     |
 | `VM_BAKE_TIMEOUT`                 | 900s    | `vm-init` bake: guest agent responds during first boot (covers cloud-init's package_update/upgrade on `bridged`, which can genuinely take minutes) |
-| `VM_BAKE_CLOUDINIT_TIMEOUT`       | 120s    | `vm-init` bake: `cloud-init status --wait` reports done, *after* the guest agent already answered - see "Diagnosing a hung boot" for why this is a separate, smaller budget |
+| `VM_BAKE_CLOUDINIT_TIMEOUT`       | 120s    | `vm-init` bake: cloud-init's completion message appears in `serial.log`, *after* the guest agent already answered - see "Diagnosing a hung boot" for why this is a separate, smaller budget |
 | `VM_BAKE_SHUTDOWN_TIMEOUT`        | 120s    | `vm-init` bake: qemu exits after the bake's own graceful shutdown request - matches `VM_HALT_TIMEOUT`'s default deliberately, since it's the same underlying operation (ACPI shutdown wait) just on a freshly-provisioned guest instead of an already-settled one |
 | `VM_FULLTEST_BOOT_TIMEOUT`        | 240s    | `vm-fulltest`: overrides `VM_START_TIMEOUT` for its own boot assertions (both boots) - deliberately larger than the plain default for test-environment margin |
 | `VM_FULLTEST_RESTART_TIMEOUT`     | 240s    | `vm-fulltest`: guest agent responds again after `vm-restart`               |
@@ -546,29 +555,25 @@ hand, but an actual `bin/vm-fulltest example.vmc` run — with a real sudo
 password typed in when prompted — is still owed before treating it as
 confirmed working.
 
-## Known open issue: intermittent bake-shutdown timeout
+## Resolved: intermittent bake-shutdown timeout
 
 Two consecutive automated `bin/vm-fulltest example-nosudo.vmc` runs (back-
-to-back: tear down, rebuild, tear down, rebuild) both hit `vm-init`'s bake
-boot failing to power off within `VM_BAKE_SHUTDOWN_TIMEOUT` (120s), even
-though a *later* `vm-halt` in the same test run — same guest OS, but
+to-back: tear down, rebuild, tear down, rebuild) once both hit `vm-init`'s
+bake boot failing to power off within `VM_BAKE_SHUTDOWN_TIMEOUT` (120s),
+even though a *later* `vm-halt` in the same test run — same guest OS, but
 already-settled rather than freshly-provisioned — powered off fine within
-120s both times. A manual (non-automated, non-back-to-back) run by this
-project's owner completed cleanly instead, so this looks more like a timing-
-or load-sensitive race than a deterministic bug.
-
-Since then, `wait_for_cloud_init_done` (see "Diagnosing a hung boot" above)
-was added specifically to test the hypothesis that the shutdown request was
+120s both times. The working theory was that the shutdown request was
 racing against cloud-init's own final-stage work still being genuinely in
-progress. **This has not yet been re-tested against a real reproduction** —
-if you hit the bake-shutdown timeout again, check whether it's now
-consistently getting past the new "cloud-init reported done after Ns"
-message before requesting shutdown (in which case this hypothesis is
-disproven and something else is the cause), and check `.run/serial.log`
-for what the guest's console was actually doing in the gap between
-"Requesting shutdown so the disk can be finalized..." and either
-completion or the `Guest didn't power off within Ns` failure. That log
-gets overwritten by the *next* boot, so to actually catch it, run
+progress — "guest agent responded" was being treated as "cloud-init is
+done", which isn't actually the same thing.
+
+`wait_for_cloud_init_done` (see "Diagnosing a hung boot" above) was added
+to close that gap, and a subsequent `bin/vm-fulltest example-nosudo.vmc`
+run passed cleanly end to end, including the previously-flaky bake step.
+If it resurfaces, check `.run/serial.log` for what the guest's console was
+doing between "Requesting shutdown so the disk can be finalized..." and
+either completion or a `Guest didn't power off within Ns` failure — that
+log gets overwritten by the *next* boot, so to actually catch it, run
 `bin/vm-init` on its own (not via `vm-fulltest`, which immediately runs
 `vm-start` afterward and clears it) and inspect the log right after a
 failure, before doing anything else with that VM.

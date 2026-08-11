@@ -33,14 +33,6 @@ disable_root: true
 #       password: jupiter
 #       type: text
 
-write_files:
-  - path: /etc/ssh/sshd_config.d/99-cloud-init-password.conf
-    owner: root:root
-    permissions: "0644"
-    content: |
-      PasswordAuthentication no
-      PubkeyAuthentication yes
-
 package_update: true
 package_upgrade: true
 
@@ -62,13 +54,71 @@ packages:
   - net-tools
   - chrony
   - ca-certificates
+  - snapd
+  - nfs-common
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-cloud-init-password.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      PubkeyAuthentication yes
+
+  - path: /etc/cloud/templates/hosts.debian.tmpl
+    owner: root:root
+    permissions: "0644"
+    content: |
+      ## template:jinja
+      127.0.1.1 {{fqdn}} {{hostname}}
+      127.0.0.1 localhost
+
+      # The following lines are desirable for IPv6 capable hosts
+      ::1 localhost ip6-localhost ip6-loopback
+      ff02::1 ip6-allnodes
+      ff02::2 ip6-allrouters
+
+      10.0.7.1 jupiter01 jupiter01.local jupiter01.gautier.local
+      10.0.7.2 jupiter02 jupiter02.local jupiter02.gautier.local
+      10.0.7.3 jupiter03 jupiter03.local jupiter03.gautier.local
+      10.0.7.4 jupiter04 jupiter04.local jupiter04.gautier.local
+      10.0.7.5 jupiter05 jupiter05.local jupiter05.gautier.local
+      10.0.7.6 jupiter06 jupiter06.local jupiter06.gautier.local
+      10.0.7.7 jupiter07 jupiter07.local jupiter07.gautier.local
+      10.0.7.8 jupiter08 jupiter08.local jupiter08.gautier.local
+      10.0.7.9 jupiter09 jupiter09.local jupiter09.gautier.local
+
+  - path: /etc/systemd/resolved.conf.d/01-jupiter.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Resolve]
+      DNS=10.0.7.1
+      FallbackDNS=10.0.4.1
+      DNSStubListener=no
+
+mounts:
+  - [ "10.0.4.143:/volume1/containers", "/mnt/nfs/data", "nfs", "rw,hard,_netdev,nofail,vers=3,timeo=600,retrans=2", "0", "0" ]
+  - [ "10.0.4.44:/volume1/containers", "/mnt/nfs/backup", "nfs", "rw,hard,_netdev,nofail,vers=3,timeo=600,retrans=2", "0", "0" ]
+
 
 runcmd:
   - systemctl enable --now chrony
   - systemctl enable --now qemu-guest-agent
+  - mkdir -p /run/sshd
   - sshd -t
   - systemctl restart ssh
-  
+  # Apply the resolver configuration before MicroK8s starts.
+  - systemctl daemon-reload
+  - systemctl restart systemd-resolved
+  # Pin every cluster node to the same MicroK8s release track.
+  - snap install microk8s --classic --channel=1.36/stable
+  - usermod -a -G microk8s ${VM_NAME}
+  - mkdir -p /home/${VM_NAME}/.kube
+  - chown -R ${VM_NAME}:${VM_NAME} /home/${VM_NAME}/.kube
+  - snap alias microk8s.kubectl kubectl
+  - microk8s status --wait-ready
+
 growpart:
   mode: auto
   devices:

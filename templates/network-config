@@ -17,5 +17,6 @@ ethernets:
         via: ${VM_GATEWAY}
     nameservers:
       addresses:
+        - 10.0.7.1
         - ${VM_GATEWAY}
     dhcp-identifier: mac

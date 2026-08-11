@@ -513,7 +513,7 @@ wait_for_qga_ready "${BAKE_TIMEOUT}" 5 ||
 # own sequence - by the time the agent answers, cloud-init should have
 # little left to do), so this timeout is intentionally much smaller than
 # BAKE_TIMEOUT; it's a confirmation, not expected to be the long pole.
-BAKE_CLOUDINIT_TIMEOUT="${VM_BAKE_CLOUDINIT_TIMEOUT:-120}"
+BAKE_CLOUDINIT_TIMEOUT="${VM_BAKE_CLOUDINIT_TIMEOUT:-240}"
 wait_for_cloud_init_done "${BAKE_CLOUDINIT_TIMEOUT}" ||
     fail "cloud-init did not report done within ${BAKE_CLOUDINIT_TIMEOUT}s during bake boot - see ${RUN_DIR}/qemu.log and ${SERIAL_LOG}"
 

@@ -301,69 +301,50 @@ wait_for_qga_ready() {
 # Confirms cloud-init has *actually finished* - not just that the guest
 # agent answered a ping, which only proves qemu-ga itself is up and
 # listening. cloud-init could still be doing its own final-stage work
-# after that (write_files, final_message, ...), and initiating a
-# shutdown while it's still genuinely busy is a real, separate suspect
-# for a slow/hung bake shutdown - see README's "Diagnosing a hung boot".
+# after that, and initiating a shutdown while it's still genuinely busy
+# is a real, separate suspect for a slow/hung bake shutdown - see
+# README's "Diagnosing a hung boot".
 #
-# Uses the guest agent's guest-exec to run `cloud-init status --wait`
-# inside the guest - a real cloud-init command purpose-built for exactly
-# this kind of synchronization, which blocks until every stage is done
-# and returns a real exit code (0 = done, 2 = degraded/recoverable
-# warnings, anything else = a real error) - then polls guest-exec-status
-# for that exit code. Only call this after wait_for_qga_ready has already
-# succeeded; guest-exec would just fail to launch otherwise.
-#
-# Uses one-shot qga_send calls (a fresh connection per request) rather
-# than wait_for_qga_ready's persistent-connection trick - that trick
-# exists because reconnecting *before* the guest has booted far enough
-# to open its end of the port can desync it; by this point the agent is
-# already confirmed up and answering, which is a different, and believed
-# safe, window. If this wait itself is ever seen to hang the way the
-# original guest-ping problem did, that assumption is the first thing to
-# revisit.
+# Polls the *host-side* SERIAL_LOG (must already be set) for the
+# distinctive final_message text templates/user-data*'s "final_message:"
+# field renders - cloud-init's cc_final_message module prints this near
+# the very end of its own last stage, tagged like a normal kernel console
+# line (e.g. "[ 33.08] cloud-init[1010]: ***** CLOUD-INIT COMPLETED
+# *****"), and this is confirmed - from a real completed boot's
+# serial.log - to reliably reach the console. Deliberately host-side
+# rather than another round of guest-agent traffic (guest-exec, polling
+# guest-exec-status, ...): the original hang this project hit was caused
+# by reconnect churn on that exact channel, so adding a second mechanism
+# that depends on it for a problem a simple file grep already solves is
+# the wrong trade. Trade-off, to be clear-eyed about: this can't
+# distinguish a clean finish from one where something failed but
+# cloud-init still reached its last stage (unlike `cloud-init status
+# --wait`'s real exit code) - acceptable here, since the question this
+# answers is only "is it safe to request a shutdown now", not "did
+# provisioning fully succeed".
+CLOUD_INIT_DONE_MARKER="***** CLOUD-INIT COMPLETED *****"
 wait_for_cloud_init_done() {
     _timeout="$1"
     _start_epoch="$(date +%s)"
     _wait_announce_start "Waiting for cloud-init to report done" "${_timeout}"
 
-    _launch="$(qga_send '{"execute":"guest-exec","arguments":{"path":"/usr/bin/cloud-init","arg":["status","--wait"],"capture-output":true}}' 5 2>/dev/null)"
-    _pid="$(printf '%s\n' "${_launch}" | jq -r 'select(.return.pid != null) | .return.pid' 2>/dev/null | tail -n1)"
-    if [ -z "${_pid}" ] ; then
-        warn "Could not launch 'cloud-init status --wait' via guest-exec - skipping this check"
-        return 1
-    fi
-
     _last_note=0
     while true ; do
+        if command grep -qF "${CLOUD_INIT_DONE_MARKER}" "${SERIAL_LOG}" 2>/dev/null ; then
+            _elapsed=$(( $(date +%s) - _start_epoch ))
+            printf ' - cloud-init reported done after %ss\n' "${_elapsed}" >&2
+            return 0
+        fi
         _elapsed=$(( $(date +%s) - _start_epoch ))
         if [ "${_elapsed}" -ge "${_timeout}" ] ; then
             printf ' - cloud-init still not done (waited %ss, timeout %ss)\n' "${_elapsed}" "${_timeout}" >&2
             return 1
         fi
-        _status="$(qga_send "{\"execute\":\"guest-exec-status\",\"arguments\":{\"pid\":${_pid}}}" 5 2>/dev/null)"
-        if printf '%s\n' "${_status}" | jq -e 'select(.return.exited == true)' >/dev/null 2>&1 ; then
-            _exitcode="$(printf '%s\n' "${_status}" | jq -r '.return.exitcode // empty' 2>/dev/null)"
-            _elapsed=$(( $(date +%s) - _start_epoch ))
-            case "${_exitcode}" in
-                0)
-                    printf ' - cloud-init reported done after %ss\n' "${_elapsed}" >&2
-                    return 0
-                    ;;
-                2)
-                    warn "cloud-init reported a degraded status (exit 2, recoverable warnings only) after ${_elapsed}s - continuing"
-                    return 0
-                    ;;
-                *)
-                    warn "cloud-init status --wait exited ${_exitcode} after ${_elapsed}s - see serial.log"
-                    return 1
-                    ;;
-            esac
-        fi
         if [ $((_elapsed - _last_note)) -ge 15 ] ; then
             _wait_progress_note "${_elapsed}" "${_timeout}"
             _last_note="${_elapsed}"
         fi
-        sleep 3
+        sleep 2
     done
 }
 
