@@ -109,6 +109,7 @@ load_vm_variable "NAME"
 load_vm_variable "INSTANCE"
 load_vm_variable "DOMAIN"
 load_vm_variable "CPUS"
+load_vm_variable "NETDEV"
 load_vm_variable "MEMORY"
 load_vm_variable "DISK"
 load_vm_variable "MAC"
@@ -460,7 +461,7 @@ set -- \
 #             means SSH is actually usable even in user mode).
 if [ "${VM_NETMODE}" = "bridged" ] ; then
     set -- "$@" \
-      -netdev vmnet-bridged,id=net0,ifname=en1 \
+      -netdev vmnet-bridged,id=net0,ifname=${VM_NETDEV} \
       -device virtio-net-pci,netdev=net0,mac="${VM_MAC}"
 else
     SSH_HOST_PORT=$((20000 + 10#${VM_INSTANCE}))

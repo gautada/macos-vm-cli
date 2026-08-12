@@ -146,7 +146,7 @@ set -- \
 # otherwise reachable from the host at all.
 if [ "${VM_NETMODE}" = "bridged" ] ; then
     set -- "$@" \
-      -netdev vmnet-bridged,id=net0,ifname=en1 \
+      -netdev vmnet-bridged,id=net0,ifname=${NETDEV} \
       -device virtio-net-pci,netdev=net0,mac="${MAC}"
 else
     SSH_HOST_PORT=$((20000 + 10#${INSTANCE}))

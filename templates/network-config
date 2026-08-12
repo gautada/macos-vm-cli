@@ -3,10 +3,9 @@ renderer: networkd
 
 ethernets:
   lan:
-  # enp0s3:
     match:
       macaddress: "${VM_MAC}"
-    set-name: enp0s3
+    set-name: "enp0s3"
     optional: true
     dhcp4: false
     dhcp6: false
