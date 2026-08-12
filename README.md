@@ -577,3 +577,9 @@ log gets overwritten by the *next* boot, so to actually catch it, run
 `bin/vm-init` on its own (not via `vm-fulltest`, which immediately runs
 `vm-start` afterward and clears it) and inspect the log right after a
 failure, before doing anything else with that VM.
+
+## Note: Sleeping
+
+When running a VM as a k8s cluster node the host kept sleeping.  I changed
+settings in Host mac Settings.  I added the `sudo pmset -a sleep 0 disksleep 0
+` manual cli setup
